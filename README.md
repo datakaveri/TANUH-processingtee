@@ -1,27 +1,25 @@
-# AMD SEV Enclave Manager
+# Processing TEE Image
 
-##Enclave Manager:
-Enclave is a trusted execution environment (TEE) embedded in a process. The enclave manager is a server that provides communication between the enclave and the APD.
+This directory is a self-contained Docker build context for the Processing TEE / GPU CS side.
 
-## Enclave Manager Endpoints:
+The image:
+- builds the RA-TLS GPU CS server from `b2p-ratls`
+- starts GPU CS on `LISTEN_ADDR`, default `:443`
+- starts `enclave_manager_new.py` on port `4000`
+- accepts `/api/load-model` over the verified RA-TLS channel
+- materializes the JSON job payload into `model.onnx`, `model.onnx.data`, and dataset ID
+- creates placeholder encrypted datasets and keys at runtime
+- decrypts the selected dataset from `encrypted_dataset.json` using `dataset_keys.json`
+- writes and runs `evaluation_script.py` with ONNX Runtime
+- posts results back to the Buffer callback URL
+- deallocates itself through `stop-processing-vm.sh` after 300s idle or after job completion
 
-1. Deploy Enclave (/enclave/deploy): This takes as input github repo link, branch, and name & ID of enclave, and brings the enclave up and runs the application inside it.
-2. Inference (/enclave/inference): The enclave will send back the inference to the task manager, after it is done running the application.
-3. Get State (/enclave/state): This will return a json object of the current state of the application, its description and the step it's currently on.
+Important runtime env vars, supplied through Confidential Space metadata as `tee-env-*`:
+- `LISTEN_ADDR=:443`
+- `RATLS_AUDIENCE=ratls-buffer-tee`
+- `PROCESSING_IDLE_TIMEOUT_SECONDS=300`
+- `PROCESSING_DEALLOCATE_AFTER_JOB=1`
 
-## How to Dockerize applications for running inside AMD CVM
-
-1. Clone the repository into the VM/your personal device, go into the application directory and add the Dockerfile
-2. Creat a Github PAT (with write & delete packages permission)
-3. Then login to the Github Container Registry
-      `export token=<your_PAT>`
-      `echo $token | docker login ghcr.io -u <Github_Username> --password-stdin`
-   It should say login succeeded.
-4. Build the docker image using the following command:
-      `sudo docker build -t <image_name> . `
-5. Tag the image
-      `docker tag <image_name> ghcr.io/datakaveri/<package_name>`
-6. Push the image
-      `docker push ghcr.io/datakaveri/<package_name>:<tag>`
-
-   
+Debug trail:
+- VM serial/container logs include `gpu-cs:`, `[Google-CVM workflow]`, and `[evaluation_script]` lines.
+- Runtime state and per-job results are written under `/app/cvm_workflow` inside the container.

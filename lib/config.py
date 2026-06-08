@@ -129,7 +129,13 @@ class Config:
         self.cors = PathNamespace()
         for key, value in cors_config.items():
             setattr(self.cors, key, value)
-    
+
+        # GCP configuration
+        gcp_config = self._config.get('gcp', {})
+        self.gcp = PathNamespace()
+        for key, value in gcp_config.items():
+            setattr(self.gcp, key, value)
+
     def _validate_and_create_dirs(self):
         """Validate paths and auto-create missing directories."""
         # Directories that should be auto-created
@@ -245,6 +251,24 @@ class Config:
         """
         base_cmd = self.get_command('docker_compose', use_sudo=use_sudo)
         return base_cmd + list(args)
+
+    def get_dataset_gcp_config(self, dataset_id: int) -> dict:
+        """
+        Return GCS object path and Secret Manager secret ID for a given dataset_id.
+
+        Returns:
+            dict with keys 'gcs_object' and 'secret_id'
+
+        Raises:
+            ConfigError if dataset_id is not in config
+        """
+        dataset_map = self.gcp.dataset_map
+        key = str(dataset_id)
+        if key not in dataset_map:
+            raise ConfigError(
+                f"Unknown dataset_id: {dataset_id}. Valid ids: {list(dataset_map.keys())}"
+            )
+        return dataset_map[key]
 
 
 # Singleton instance

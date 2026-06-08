@@ -85,3 +85,20 @@ cors:
     - Authorization
   supports_credentials: true
   max_age: 3600
+
+# GCP configuration for dataset storage and key management
+gcp:
+  project_id: p3dx-depa-sandbox
+  datasets_bucket: tanuh-benchmark-datasets
+
+  # Maps dataset_id (as string) to GCS object path and Secret Manager secret ID
+  dataset_map:
+    "1":
+      gcs_object: datasets/dataset_1.enc
+      secret_id: tanuh-dataset-key-1
+    "2":
+      gcs_object: datasets/dataset_2.enc
+      secret_id: tanuh-dataset-key-2
+    "3":
+      gcs_object: datasets/dataset_3.enc
+      secret_id: tanuh-dataset-key-3

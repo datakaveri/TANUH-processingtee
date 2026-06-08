@@ -8,19 +8,23 @@ import sys
 import subprocess
 import time
 import logging
+import threading
 import traceback
 from pathlib import Path
 
 _LOCAL_VENDOR = Path(__file__).resolve().parent / ".vendor"
 if _LOCAL_VENDOR.exists() and str(_LOCAL_VENDOR) not in sys.path:
-    sys.path.insert(0, str(_LOCAL_VENDOR))
+    sys.path.append(str(_LOCAL_VENDOR))
 
 from flask import Flask, jsonify, Response, request
 from flask_cors import CORS
 from werkzeug.exceptions import HTTPException
 import P3DX_SDK
+import requests
 from lib.config import config
 from cryptography.fernet import Fernet
+from Fetch_data.secrets import fetch_secret
+from Fetch_data.gcs_fetch import download_gcs_object
 
 
 app = Flask(__name__)
@@ -58,6 +62,26 @@ CVM_ARTIFACTS_DIR = CVM_WORKFLOW_DIR / "artifacts"
 CVM_INCOMING_DIR = CVM_WORKFLOW_DIR / "incoming"
 CVM_RUNTIME_DIR = CVM_WORKFLOW_DIR / "runtime"
 CVM_EVALUATION_SCRIPT = CVM_WORKFLOW_DIR / "evaluation_script.py"
+CVM_SECURE_JOBS_DIR = CVM_WORKFLOW_DIR / "secure_jobs"
+CVM_SECURE_STATE_PATH = CVM_RUNTIME_DIR / "secure_runtime_state.json"
+MODEL_FILE_NAME = "model.onnx"
+WEIGHTS_FILE_NAME = "model.onnx.data"
+PROCESSING_IDLE_TIMEOUT_SECONDS = int(os.getenv("PROCESSING_IDLE_TIMEOUT_SECONDS", "300"))
+PROCESSING_VM_STOP_SCRIPT = os.getenv(
+    "PROCESSING_VM_STOP_SCRIPT",
+    str(Path(config.base_dir) / "stop-processing-vm.sh"),
+)
+PROCESSING_VM_STOP_COMMAND = os.getenv("PROCESSING_VM_STOP_COMMAND", "")
+PROCESSING_DEALLOCATE_AFTER_JOB = os.getenv("PROCESSING_DEALLOCATE_AFTER_JOB", "1") == "1"
+SECURE_JOB_LOCK = threading.Lock()
+SECURE_JOB_STATE = {
+    "status": "waiting_for_job",
+    "last_activity_unix": int(time.time()),
+    "current_job_id": "",
+    "last_job_id": "",
+    "last_error": "",
+    "deallocation_requested": False,
+}
 
 # Placeholder verifier endpoint. In production this should be the remote verifier
 # endpoint that receives the SEV-SNP attestation report from this Google CVM.
@@ -77,7 +101,7 @@ def _ensure_vendor_path():
     """Prefer local runtime wheels installed under .vendor for ONNX testing."""
     vendor_path = Path(config.base_dir) / ".vendor"
     if vendor_path.exists() and str(vendor_path) not in sys.path:
-        sys.path.insert(0, str(vendor_path))
+        sys.path.append(str(vendor_path))
 
 
 def _json_dump(path, data):
@@ -97,6 +121,147 @@ def _sha256_file(path):
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def _ensure_cvm_dirs():
+    for directory in (
+        CVM_WORKFLOW_DIR,
+        CVM_ARTIFACTS_DIR,
+        CVM_INCOMING_DIR,
+        CVM_RUNTIME_DIR,
+        CVM_SECURE_JOBS_DIR,
+    ):
+        directory.mkdir(parents=True, exist_ok=True)
+
+
+def _secure_runtime_state():
+    if CVM_SECURE_STATE_PATH.exists():
+        return _json_load(CVM_SECURE_STATE_PATH)
+    return dict(SECURE_JOB_STATE)
+
+
+def _write_secure_runtime_state():
+    _json_dump(CVM_SECURE_STATE_PATH, SECURE_JOB_STATE)
+
+
+def _set_secure_job_state(**updates):
+    SECURE_JOB_STATE.update(updates)
+    SECURE_JOB_STATE["last_activity_unix"] = int(time.time())
+    _write_secure_runtime_state()
+    cvm_debug(f"Secure runtime state updated: {SECURE_JOB_STATE}")
+    return dict(SECURE_JOB_STATE)
+
+
+def _deallocation_command():
+    if PROCESSING_VM_STOP_COMMAND.strip():
+        return PROCESSING_VM_STOP_COMMAND.strip(), "command"
+
+    candidate = Path(PROCESSING_VM_STOP_SCRIPT)
+    if candidate.exists():
+        return str(candidate), "script"
+
+    return "", ""
+
+
+def request_vm_deallocation(reason):
+    if SECURE_JOB_STATE.get("deallocation_requested"):
+        cvm_debug(f"VM deallocation already requested earlier; skipping duplicate request ({reason})")
+        return False
+
+    target, mode = _deallocation_command()
+    if not target:
+        cvm_debug(
+            f"No VM stop command/script configured; would deallocate Processing TEE now because: {reason}"
+        )
+        _set_secure_job_state(
+            status="deallocation_pending",
+            deallocation_requested=True,
+            last_error=f"stop command missing: {reason}",
+        )
+        return False
+
+    cvm_debug(f"Requesting Processing TEE deallocation via {mode}: {target} ({reason})")
+    try:
+        if mode == "command":
+            completed = subprocess.run(
+                target,
+                cwd=config.base_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                shell=True,
+                check=False,
+            )
+        else:
+            completed = subprocess.run(
+                [target],
+                cwd=config.base_dir,
+                capture_output=True,
+                text=True,
+                timeout=60,
+                check=False,
+            )
+    except Exception as exc:
+        cvm_debug(f"Processing VM stop invocation failed: {exc}")
+        _set_secure_job_state(
+            status="deallocation_failed",
+            deallocation_requested=True,
+            last_error=f"stop invocation failed: {exc}",
+        )
+        return False
+
+    if completed.stdout:
+        print(completed.stdout, end="", flush=True)
+    if completed.stderr:
+        print(completed.stderr, end="", flush=True)
+
+    if completed.returncode != 0:
+        _set_secure_job_state(
+            status="deallocation_failed",
+            deallocation_requested=True,
+            last_error=f"stop command exited with {completed.returncode}",
+        )
+        return False
+
+    _set_secure_job_state(
+        status="deallocation_requested",
+        deallocation_requested=True,
+        last_error="",
+    )
+    return True
+
+
+def _idle_deallocator_loop():
+    while True:
+        time.sleep(5)
+        try:
+            if SECURE_JOB_STATE.get("deallocation_requested"):
+                continue
+            if SECURE_JOB_STATE.get("status") == "running":
+                continue
+            idle_for = int(time.time()) - int(SECURE_JOB_STATE.get("last_activity_unix", int(time.time())))
+            if idle_for >= PROCESSING_IDLE_TIMEOUT_SECONDS:
+                cvm_debug(
+                    f"No secure job payload received for {idle_for}s; requesting VM deallocation"
+                )
+                request_vm_deallocation(
+                    f"idle timeout exceeded ({idle_for}s >= {PROCESSING_IDLE_TIMEOUT_SECONDS}s)"
+                )
+        except Exception as exc:
+            cvm_debug(f"Idle deallocator loop error: {exc}")
+
+
+def start_idle_deallocator_thread():
+    _ensure_cvm_dirs()
+    _write_secure_runtime_state()
+    thread = threading.Thread(
+        target=_idle_deallocator_loop,
+        name="processing-idle-deallocator",
+        daemon=True,
+    )
+    thread.start()
+    cvm_debug(f"Started idle deallocator thread (tid={thread.ident})")
+    return thread
 
 
 def _hardware_evidence():
@@ -295,8 +460,8 @@ def create_placeholder_encrypted_datasets(force=False):
 
 
 def create_placeholder_resnet34_onnx(force=False):
-    model_path = CVM_ARTIFACTS_DIR / "model.onnx"
-    weights_path = CVM_ARTIFACTS_DIR / "model_weights.onnx.data"
+    model_path = CVM_ARTIFACTS_DIR / MODEL_FILE_NAME
+    weights_path = CVM_ARTIFACTS_DIR / WEIGHTS_FILE_NAME
     if model_path.exists() and weights_path.exists() and not force:
         cvm_debug(f"Placeholder ONNX model already exists at {model_path}")
         return model_path, weights_path
@@ -324,7 +489,6 @@ def create_placeholder_resnet34_onnx(force=False):
         output_names=["logits"],
         dynamic_axes={"input": {0: "batch"}, "logits": {0: "batch"}},
         opset_version=17,
-        dynamo=False,
     )
 
     onnx_model = onnx.load(str(temp_model_path))
@@ -353,8 +517,8 @@ def create_placeholder_confirmation(force=False, dataset_id=1, ensure_artifacts=
         model_path, weights_path = create_placeholder_resnet34_onnx(force=force)
         create_placeholder_encrypted_datasets(force=force)
     else:
-        model_path = CVM_ARTIFACTS_DIR / "model.onnx"
-        weights_path = CVM_ARTIFACTS_DIR / "model_weights.onnx.data"
+        model_path = CVM_ARTIFACTS_DIR / MODEL_FILE_NAME
+        weights_path = CVM_ARTIFACTS_DIR / WEIGHTS_FILE_NAME
     confirmation = {
         "model": model_path.name,
         "weights": weights_path.name,
@@ -407,39 +571,169 @@ def wait_for_confirmation_payload(timeout_seconds=30):
 
 
 def decrypt_selected_dataset(dataset_id):
-    cvm_debug(f"Selecting encrypted dataset_id={dataset_id}")
-    encrypted_path = CVM_ARTIFACTS_DIR / "encrypted_dataset.json"
-    keys_path = CVM_ARTIFACTS_DIR / "dataset_keys.json"
-    encrypted_payload = _json_load(encrypted_path)
-    key_payload = _json_load(keys_path)
+    cvm_debug(f"Fetching dataset_id={dataset_id} from GCS + Secret Manager")
 
-    dataset_key = str(dataset_id)
-    if dataset_key not in encrypted_payload["datasets"]:
-        raise ValueError(f"dataset_id {dataset_id} not found in encrypted_dataset.json")
-    if dataset_key not in key_payload["keys"]:
-        raise ValueError(f"dataset_id {dataset_id} key not found in dataset_keys.json")
+    dataset_cfg = config.get_dataset_gcp_config(dataset_id)
+    gcs_object = dataset_cfg["gcs_object"]
+    secret_id = dataset_cfg["secret_id"]
+    project_id = config.gcp.project_id
+    bucket = config.gcp.datasets_bucket
 
-    cvm_debug("PLACEHOLDER Secret Manager lookup: reading symmetric key from dataset_keys.json")
-    cipher = Fernet(key_payload["keys"][dataset_key].encode("utf-8"))
-    plaintext = cipher.decrypt(encrypted_payload["datasets"][dataset_key]["ciphertext"].encode("utf-8"))
+    # Fetch Fernet key from Secret Manager
+    cvm_debug(f"Fetching Fernet key from Secret Manager: {secret_id}")
+    fernet_key_bytes = fetch_secret(project_id, secret_id)
+
+    # Download encrypted dataset from GCS to a temp file
+    enc_path = CVM_ARTIFACTS_DIR / f"dataset_{dataset_id}.enc"
+    cvm_debug(f"Downloading encrypted dataset from gs://{bucket}/{gcs_object}")
+    download_gcs_object(bucket, gcs_object, str(enc_path))
+
+    # Decrypt in memory
+    cvm_debug("Decrypting dataset with Fernet key")
+    cipher = Fernet(fernet_key_bytes)
+    with open(enc_path, "rb") as f:
+        encrypted_data = f.read()
+
+    # Remove encrypted file immediately after reading
+    enc_path.unlink()
+
+    plaintext = cipher.decrypt(encrypted_data)
     dataset = json.loads(plaintext.decode("utf-8"))
 
+    # Write decrypted dataset to runtime dir (consumed by evaluation script)
     selected_dataset_path = CVM_RUNTIME_DIR / f"dataset_{dataset_id}_decrypted.json"
     _json_dump(selected_dataset_path, dataset)
-    cvm_debug(f"Selected dataset decrypted to {selected_dataset_path}")
+    cvm_debug(f"Dataset {dataset_id} decrypted and saved to {selected_dataset_path}")
     return selected_dataset_path
 
 
-def run_evaluation_script(confirmation, dataset_path):
-    model_path = CVM_ARTIFACTS_DIR / confirmation["model"]
-    weights_path = CVM_ARTIFACTS_DIR / confirmation["weights"]
-    results_path = CVM_RUNTIME_DIR / "results.json"
+def ensure_evaluation_script():
+    """Write the evaluation script consumed by the secure Processing TEE job."""
+    script = r'''#!/usr/bin/env python3
+import argparse
+import hashlib
+import json
+import time
+from pathlib import Path
 
+import numpy as np
+import onnxruntime as ort
+
+
+def debug(message):
+    print(f"[evaluation_script] {message}", flush=True)
+
+
+def sha256_file(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--dataset", required=True)
+    parser.add_argument("--results", required=True)
+    args = parser.parse_args()
+
+    started = time.time()
+    model_path = Path(args.model)
+    dataset_path = Path(args.dataset)
+    results_path = Path(args.results)
+
+    debug(f"Loading decrypted dataset from {dataset_path}")
+    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
+    features = np.asarray(dataset["features"], dtype=np.float32)
+    labels = np.asarray(dataset["labels"], dtype=np.int64)
+    debug(f"Dataset id={dataset.get('dataset_id')} description={dataset.get('description')}")
+    debug(f"Feature tensor shape={list(features.shape)} labels={len(labels)}")
+
+    debug(f"Creating ONNX Runtime session for {model_path}")
+    debug(f"Model SHA256={sha256_file(model_path)}")
+    external_weights = model_path.parent / "model.onnx.data"
+    if external_weights.exists():
+        debug(f"External weights SHA256={sha256_file(external_weights)}")
+    else:
+        raise FileNotFoundError(f"External weights file missing: {external_weights}")
+
+    import onnx
+    onnx_model = onnx.load(str(model_path), load_external_data=True)
+    session = ort.InferenceSession(onnx_model.SerializeToString(), providers=["CPUExecutionProvider"])
+    input_meta = session.get_inputs()[0]
+    input_name = input_meta.name
+    output_names = [output.name for output in session.get_outputs()]
+    debug(f"ONNX input={input_name} shape={input_meta.shape} outputs={output_names}")
+
+    batch_size = 8
+    logits_batches = []
+    for offset in range(0, len(features), batch_size):
+        batch = features[offset : offset + batch_size]
+        debug(f"Running inference batch offset={offset} size={len(batch)}")
+        logits = session.run(output_names, {input_name: batch})[0]
+        logits_batches.append(np.asarray(logits))
+
+    logits = np.concatenate(logits_batches, axis=0)
+    predictions = logits.argmax(axis=1).astype(np.int64)
+    accuracy = float((predictions == labels).mean()) if len(labels) else 0.0
+    max_seen_class = int(max(predictions.max(initial=0), labels.max(initial=0)))
+    declared_classes = int(dataset.get("num_classes") or 0)
+    matrix_size = max(declared_classes, max_seen_class + 1)
+    confusion = np.zeros((matrix_size, matrix_size), dtype=np.int64)
+    for truth, predicted in zip(labels, predictions):
+        confusion[int(truth), int(predicted)] += 1
+
+    distribution = {
+        str(class_id): int((predictions == class_id).sum())
+        for class_id in range(matrix_size)
+    }
+    results = {
+        "status": "success",
+        "dataset_id": dataset.get("dataset_id"),
+        "dataset_description": dataset.get("description"),
+        "num_samples": int(len(labels)),
+        "num_classes": int(matrix_size),
+        "accuracy": accuracy,
+        "prediction_distribution": distribution,
+        "confusion_matrix": confusion.tolist(),
+        "onnx_runtime_providers": session.get_providers(),
+        "onnx_input_name": input_name,
+        "onnx_output_names": output_names,
+        "logits_shape": list(logits.shape),
+        "elapsed_seconds": round(time.time() - started, 4),
+    }
+
+    results_path.parent.mkdir(parents=True, exist_ok=True)
+    results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
+    debug(f"Results written to {results_path}")
+
+
+if __name__ == "__main__":
+    main()
+'''
+    _ensure_cvm_dirs()
+    if CVM_EVALUATION_SCRIPT.exists() and CVM_EVALUATION_SCRIPT.read_text(encoding="utf-8") == script:
+        cvm_debug(f"Evaluation script already present at {CVM_EVALUATION_SCRIPT}")
+        return CVM_EVALUATION_SCRIPT
+
+    CVM_EVALUATION_SCRIPT.write_text(script, encoding="utf-8")
+    cvm_debug(f"Evaluation script written to {CVM_EVALUATION_SCRIPT}")
+    return CVM_EVALUATION_SCRIPT
+
+
+def run_evaluation_script_from_paths(model_path, dataset_path, results_path):
+    model_path = Path(model_path)
+    dataset_path = Path(dataset_path)
+    results_path = Path(results_path)
+    weights_path = model_path.parent / WEIGHTS_FILE_NAME
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     if not weights_path.exists():
         raise FileNotFoundError(f"External ONNX weights file not found: {weights_path}")
 
+    ensure_evaluation_script()
     cvm_debug(f"Compiling ONNX model by creating ONNX Runtime session in {CVM_EVALUATION_SCRIPT}")
     cvm_debug(f"Model path: {model_path}")
     cvm_debug(f"Weights path: {weights_path}")
@@ -478,6 +772,124 @@ def run_evaluation_script(confirmation, dataset_path):
     return results_path, results
 
 
+def run_evaluation_script(confirmation, dataset_path):
+    model_path = CVM_ARTIFACTS_DIR / confirmation["model"]
+    results_path = CVM_RUNTIME_DIR / "results.json"
+    return run_evaluation_script_from_paths(model_path, dataset_path, results_path)
+
+
+def _job_dir(job_id):
+    return CVM_SECURE_JOBS_DIR / job_id
+
+
+def _materialize_secure_job_payload(payload):
+    required_fields = {
+        "job_id",
+        "dataset_id",
+        "model_onnx_base64",
+        "model_weights_base64",
+        "model_sha256",
+        "weights_sha256",
+        "buffer_results_callback_url",
+    }
+    missing = required_fields - set(payload.keys())
+    if missing:
+        raise ValueError(f"Missing fields in secure job payload: {sorted(missing)}")
+
+    job_id = payload["job_id"]
+    job_dir = _job_dir(job_id)
+    artifacts_dir = job_dir / "artifacts"
+    runtime_dir = job_dir / "runtime"
+    artifacts_dir.mkdir(parents=True, exist_ok=True)
+    runtime_dir.mkdir(parents=True, exist_ok=True)
+
+    model_path = artifacts_dir / payload.get("model_file", MODEL_FILE_NAME)
+    weights_path = artifacts_dir / payload.get("weights_file", WEIGHTS_FILE_NAME)
+    model_bytes = base64.b64decode(payload["model_onnx_base64"])
+    weights_bytes = base64.b64decode(payload["model_weights_base64"])
+
+    if hashlib.sha256(model_bytes).hexdigest() != payload["model_sha256"]:
+        raise ValueError("model.onnx SHA256 mismatch in secure payload")
+    if hashlib.sha256(weights_bytes).hexdigest() != payload["weights_sha256"]:
+        raise ValueError("model weights SHA256 mismatch in secure payload")
+
+    model_path.write_bytes(model_bytes)
+    weights_path.write_bytes(weights_bytes)
+    _json_dump(job_dir / "incoming_payload.json", payload)
+    cvm_debug(f"Secure job payload materialized under {job_dir}")
+    return {
+        "job_id": job_id,
+        "job_dir": job_dir,
+        "runtime_dir": runtime_dir,
+        "model_path": model_path,
+        "weights_path": weights_path,
+        "buffer_results_callback_url": payload["buffer_results_callback_url"],
+        "dataset_id": int(payload["dataset_id"]),
+        "hyperparameters": payload.get("hyperparameters", {}),
+    }
+
+
+def run_secure_job_pipeline(payload):
+    _ensure_cvm_dirs()
+    job_materialized = _materialize_secure_job_payload(payload)
+    job_id = job_materialized["job_id"]
+    runtime_dir = job_materialized["runtime_dir"]
+    dataset_id = int(job_materialized["dataset_id"])
+
+    _set_secure_job_state(
+        status="running",
+        current_job_id=job_id,
+        last_job_id=job_id,
+        last_error="",
+    )
+    cvm_debug(f"Secure job {job_id}: starting dataset selection for dataset_id={dataset_id}")
+
+    dataset_path = decrypt_selected_dataset(dataset_id)
+    job_dataset_path = runtime_dir / dataset_path.name
+    shutil.copy2(dataset_path, job_dataset_path)
+    cvm_debug(f"Secure job {job_id}: dataset copied to {job_dataset_path}")
+
+    results_path = runtime_dir / "results.json"
+    cvm_debug(f"Secure job {job_id}: evaluating ONNX model with runtime results at {results_path}")
+    _, results = run_evaluation_script_from_paths(
+        model_path=job_materialized["model_path"],
+        dataset_path=job_dataset_path,
+        results_path=results_path,
+    )
+    results["job_id"] = job_id
+    results["model_sha256"] = _sha256_file(job_materialized["model_path"])
+    results["weights_sha256"] = _sha256_file(job_materialized["weights_path"])
+    results["dataset_id"] = dataset_id
+    _json_dump(results_path, results)
+    cvm_debug(f"Secure job {job_id}: local results saved to {results_path}")
+
+    callback_url = job_materialized["buffer_results_callback_url"]
+    cvm_debug(f"Secure job {job_id}: POSTing results back to Buffer TEE at {callback_url}")
+    response = requests.post(
+        callback_url,
+        json=results,
+        timeout=60,
+        verify=os.getenv("BUFFER_RESULTS_VERIFY_TLS", "0") == "1",
+    )
+    response.raise_for_status()
+    cvm_debug(f"Secure job {job_id}: Buffer TEE acknowledged results with {response.status_code}")
+
+    _set_secure_job_state(
+        status="complete",
+        current_job_id="",
+        last_job_id=job_id,
+        last_error="",
+    )
+    if PROCESSING_DEALLOCATE_AFTER_JOB:
+        request_vm_deallocation(f"job {job_id} finished successfully")
+    return {
+        "status": "success",
+        "job_id": job_id,
+        "results_path": str(results_path),
+        "results": results,
+    }
+
+
 def run_google_cvm_workflow(confirmation_timeout=30, clear_runtime=False):
     """Run the requested Google AMD SEV-SNP CVM placeholder workflow end to end."""
     global state, is_app_running
@@ -490,8 +902,7 @@ def run_google_cvm_workflow(confirmation_timeout=30, clear_runtime=False):
         "description": "Building and sending attestation report",
     }
 
-    for directory in (CVM_ARTIFACTS_DIR, CVM_INCOMING_DIR, CVM_RUNTIME_DIR):
-        directory.mkdir(parents=True, exist_ok=True)
+    _ensure_cvm_dirs()
 
     if clear_runtime and CVM_RUNTIME_DIR.exists():
         cvm_debug(f"Clearing old runtime files from {CVM_RUNTIME_DIR}")
@@ -933,10 +1344,83 @@ def receive_cvm_confirmation():
     }), 200
 
 
+@app.route("/enclave/cvm/secure-job", methods=["POST"])
+def receive_secure_job():
+    content = request.json
+    if not content:
+        return jsonify({"status": "error", "message": "Missing JSON job payload"}), 400
+
+    with SECURE_JOB_LOCK:
+        if SECURE_JOB_STATE.get("status") == "running":
+            return jsonify(
+                {
+                    "status": "busy",
+                    "message": f"Already running job {SECURE_JOB_STATE.get('current_job_id')}",
+                }
+            ), 409
+
+        try:
+            _ensure_cvm_dirs()
+            job_id = content.get("job_id", "")
+            _set_secure_job_state(
+                status="job_received",
+                current_job_id=job_id,
+                last_job_id=job_id,
+                last_error="",
+                deallocation_requested=False,
+            )
+            _json_dump(CVM_INCOMING_DIR / f"{job_id}-secure-job.json", content)
+        except Exception as exc:
+            _set_secure_job_state(status="error", last_error=str(exc))
+            return jsonify({"status": "error", "message": str(exc)}), 400
+
+    def _runner():
+        try:
+            run_secure_job_pipeline(content)
+        except Exception as exc:
+            traceback.print_exc()
+            cvm_debug(f"Secure job {content.get('job_id')} failed: {exc}")
+            _set_secure_job_state(
+                status="error",
+                current_job_id="",
+                last_job_id=content.get("job_id", ""),
+                last_error=str(exc),
+            )
+            if PROCESSING_DEALLOCATE_AFTER_JOB:
+                request_vm_deallocation(f"job {content.get('job_id')} failed: {exc}")
+
+    thread = threading.Thread(
+        target=_runner,
+        name=f"secure-job-{content.get('job_id', 'unknown')}",
+        daemon=True,
+    )
+    thread.start()
+    cvm_debug(
+        f"Secure job {content.get('job_id')} accepted from RA-TLS bridge and started on thread {thread.ident}"
+    )
+    return jsonify(
+        {
+            "status": "accepted",
+            "job_id": content.get("job_id"),
+            "thread_name": thread.name,
+        }
+    ), 202
+
+
+@app.route("/enclave/cvm/runtime-state", methods=["GET"])
+def get_secure_runtime_state():
+    return jsonify({"status": "success", "runtime_state": _secure_runtime_state()}), 200
+
+
 @app.route("/enclave/cvm/results", methods=["GET"])
 def get_cvm_results():
     results_path = CVM_RUNTIME_DIR / "results.json"
     if not results_path.exists():
+        last_job_id = SECURE_JOB_STATE.get("last_job_id", "")
+        if last_job_id:
+            secure_results_path = _job_dir(last_job_id) / "runtime" / "results.json"
+            if secure_results_path.exists():
+                return jsonify(_json_load(secure_results_path)), 200
         return jsonify({"status": "processing", "message": "results.json is not available yet"}), 404
     return jsonify(_json_load(results_path)), 200
 
@@ -1156,6 +1640,8 @@ if __name__ == "__main__":
     print("  - POST /enclave/cvm/run")
     print("  - POST /enclave/cvm/prepare-fixtures")
     print("  - POST /enclave/cvm/confirmation")
+    print("  - POST /enclave/cvm/secure-job")
+    print("  - GET  /enclave/cvm/runtime-state")
     print("  - GET  /enclave/cvm/results")
     print("  - GET  /enclave/jwt")
     print("  - GET  /enclave/state")
@@ -1163,4 +1649,6 @@ if __name__ == "__main__":
     print("  - GET  /enclave/inference")
     print("  - GET  /enclave/status")
     print("=" * 60)
+    _ensure_cvm_dirs()
+    start_idle_deallocator_thread()
     app.run(host=config.service.host, port=config.service.port, debug=True)
