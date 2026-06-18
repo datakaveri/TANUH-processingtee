@@ -89,16 +89,27 @@ cors:
 # GCP configuration for dataset storage and key management
 gcp:
   project_id: p3dx-depa-sandbox
-  datasets_bucket: tanuh-benchmark-datasets
+  datasets_bucket: tanuh-datasets
+  eval_scripts_bucket: tanuh-eval-scripts
+  results_bucket: p3dx-tanuh-results
 
-  # Maps dataset_id (as string) to GCS object path and Secret Manager secret ID
+  # Maps dataset_id (as string) to:
+  #   dataset_json_object  — AES-GCM encrypted JSON (paths + labels)
+  #   images_object        — AES-GCM encrypted zip of image files
+  #   secret_id            — Secret Manager secret holding the AES-256 key (hex)
+  #   eval_script_object   — eval script object name in tanuh-eval-scripts bucket
+  #   images_extract_dir   — where images are extracted inside the TEE
+  # dataset 1 = breast cancer, dataset 2 = OCS
   dataset_map:
     "1":
-      gcs_object: datasets/dataset_1.enc
-      secret_id: tanuh-dataset-key-1
+      dataset_json_object: breast-cancer/dataset.json.enc
+      images_object: breast-cancer/images.zip.enc
+      secret_id: tanuh-ds1-key
+      eval_script_object: evaluate_model_breastcancer.py
+      images_extract_dir: /app/cvm_workflow/data/breast-cancer
     "2":
-      gcs_object: datasets/dataset_2.enc
-      secret_id: tanuh-dataset-key-2
-    "3":
-      gcs_object: datasets/dataset_3.enc
-      secret_id: tanuh-dataset-key-3
+      dataset_json_object: ocs/dataset.json.enc
+      images_object: ocs/images.zip.enc
+      secret_id: tanuh-ds2-key
+      eval_script_object: evaluate_model_OCS.py
+      images_extract_dir: /app/cvm_workflow/data/ocs
