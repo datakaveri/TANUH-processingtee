@@ -1,7 +1,10 @@
 import base64
 import hashlib
+import http.client
 import os
 import json
+import socket
+import uuid
 import platform
 import shutil
 import sys
@@ -23,8 +26,9 @@ import P3DX_SDK
 import requests
 from lib.config import config
 from cryptography.fernet import Fernet
-from Fetch_data.secrets import fetch_secret
-from Fetch_data.gcs_fetch import download_gcs_object
+from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+from Fetch_data.secrets import fetch_secret, get_oidc_token
+from Fetch_data.gcs_fetch import download_gcs_object, download_gcs_object_bytes, upload_gcs_object
 
 
 app = Flask(__name__)
@@ -570,190 +574,172 @@ def wait_for_confirmation_payload(timeout_seconds=30):
     raise TimeoutError(f"confirmation.json not received within {timeout_seconds} seconds")
 
 
+def _aesgcm_decrypt_bytes(key: bytes, enc_data: bytes) -> bytes:
+    """
+    Decrypt small AES-GCM encrypted blob.
+    Wire format: [4B nonce_len][nonce][ciphertext+tag]
+    """
+    import struct
+    nonce_len = struct.unpack(">I", enc_data[:4])[0]
+    nonce     = enc_data[4: 4 + nonce_len]
+    ct        = enc_data[4 + nonce_len:]
+    return AESGCM(key).decrypt(nonce, ct, None)
+
+
+def _aesgcm_decrypt_file_streaming(key: bytes, enc_path: Path, out_path: Path) -> None:
+    """
+    Decrypt a large AES-GCM encrypted file written in 64MB chunks.
+    Wire format:
+      [4B: num_chunks]
+      repeated: [4B: len(nonce+ct)][nonce][ciphertext+tag]
+    """
+    import struct
+    aesgcm = AESGCM(key)
+    with open(enc_path, "rb") as src, open(out_path, "wb") as dst:
+        num_chunks = struct.unpack(">I", src.read(4))[0]
+        cvm_debug(f"  decrypting {num_chunks} chunks...")
+        for i in range(num_chunks):
+            chunk_len  = struct.unpack(">I", src.read(4))[0]
+            chunk_data = src.read(chunk_len)
+            nonce      = chunk_data[:12]
+            ct         = chunk_data[12:]
+            dst.write(aesgcm.decrypt(nonce, ct, None))
+            if (i + 1) % 10 == 0:
+                cvm_debug(f"  decrypted chunk {i+1}/{num_chunks}")
+
+
 def decrypt_selected_dataset(dataset_id):
     cvm_debug(f"Fetching dataset_id={dataset_id} from GCS + Secret Manager")
 
     dataset_cfg = config.get_dataset_gcp_config(dataset_id)
-    gcs_object = dataset_cfg["gcs_object"]
-    secret_id = dataset_cfg["secret_id"]
-    project_id = config.gcp.project_id
-    bucket = config.gcp.datasets_bucket
+    secret_id   = dataset_cfg["secret_id"]
+    gcs_object  = dataset_cfg["dataset_json_object"]
+    bucket      = config.gcp.datasets_bucket
+    project_id  = config.gcp.project_id
 
-    # Fetch Fernet key from Secret Manager
-    cvm_debug(f"Fetching Fernet key from Secret Manager: {secret_id}")
-    fernet_key_bytes = fetch_secret(project_id, secret_id)
+    # Fetch AES-256 key from Secret Manager (stored as hex string)
+    cvm_debug(f"Fetching AES-256 key from Secret Manager: {secret_id}")
+    key_hex = fetch_secret(project_id, secret_id)
+    key     = bytes.fromhex(key_hex.decode("utf-8").strip())
 
-    # Download encrypted dataset from GCS to a temp file
-    enc_path = CVM_ARTIFACTS_DIR / f"dataset_{dataset_id}.enc"
-    cvm_debug(f"Downloading encrypted dataset from gs://{bucket}/{gcs_object}")
+    # Download encrypted dataset JSON from GCS
+    enc_path = CVM_ARTIFACTS_DIR / f"dataset_{dataset_id}.json.enc"
+    cvm_debug(f"Downloading encrypted dataset JSON from gs://{bucket}/{gcs_object}")
     download_gcs_object(bucket, gcs_object, str(enc_path))
 
-    # Decrypt in memory
-    cvm_debug("Decrypting dataset with Fernet key")
-    cipher = Fernet(fernet_key_bytes)
+    # Decrypt in memory (JSON is small)
     with open(enc_path, "rb") as f:
-        encrypted_data = f.read()
-
-    # Remove encrypted file immediately after reading
+        enc_data = f.read()
     enc_path.unlink()
 
-    plaintext = cipher.decrypt(encrypted_data)
-    dataset = json.loads(plaintext.decode("utf-8"))
+    plaintext = _aesgcm_decrypt_bytes(key, enc_data)
+    dataset   = json.loads(plaintext.decode("utf-8"))
 
-    # Write decrypted dataset to runtime dir (consumed by evaluation script)
     selected_dataset_path = CVM_RUNTIME_DIR / f"dataset_{dataset_id}_decrypted.json"
     _json_dump(selected_dataset_path, dataset)
     cvm_debug(f"Dataset {dataset_id} decrypted and saved to {selected_dataset_path}")
     return selected_dataset_path
 
 
-def ensure_evaluation_script():
-    """Write the evaluation script consumed by the secure Processing TEE job."""
-    script = r'''#!/usr/bin/env python3
-import argparse
-import hashlib
-import json
-import time
-from pathlib import Path
+def fetch_and_extract_images(dataset_id):
+    """
+    Download the encrypted image zip for dataset_id from GCS,
+    decrypt it (streaming AES-GCM chunks), and extract to the
+    TEE data directory defined in config.
+    """
+    import zipfile, struct
 
-import numpy as np
-import onnxruntime as ort
+    dataset_cfg    = config.get_dataset_gcp_config(dataset_id)
+    secret_id      = dataset_cfg["secret_id"]
+    images_object  = dataset_cfg["images_object"]
+    extract_dir    = Path(dataset_cfg["images_extract_dir"])
+    bucket         = config.gcp.datasets_bucket
+    project_id     = config.gcp.project_id
 
+    # Fetch AES-256 key (same key as dataset JSON)
+    cvm_debug(f"Fetching AES-256 key from Secret Manager: {secret_id}")
+    key_hex = fetch_secret(project_id, secret_id)
+    key     = bytes.fromhex(key_hex.decode("utf-8").strip())
 
-def debug(message):
-    print(f"[evaluation_script] {message}", flush=True)
+    # Download encrypted zip from GCS
+    enc_zip_path = CVM_ARTIFACTS_DIR / f"dataset_{dataset_id}_images.zip.enc"
+    cvm_debug(f"Downloading encrypted images from gs://{bucket}/{images_object}")
+    download_gcs_object(bucket, images_object, str(enc_zip_path))
 
+    # Decrypt to a temp zip file
+    zip_path = CVM_ARTIFACTS_DIR / f"dataset_{dataset_id}_images.zip"
+    cvm_debug(f"Decrypting image zip...")
+    _aesgcm_decrypt_file_streaming(key, enc_zip_path, zip_path)
+    enc_zip_path.unlink()
 
-def sha256_file(path):
-    digest = hashlib.sha256()
-    with open(path, "rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+    # Extract zip to data directory
+    extract_dir.mkdir(parents=True, exist_ok=True)
+    cvm_debug(f"Extracting images to {extract_dir}...")
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        zf.extractall(extract_dir)
+    zip_path.unlink()
 
-
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True)
-    parser.add_argument("--dataset", required=True)
-    parser.add_argument("--results", required=True)
-    args = parser.parse_args()
-
-    started = time.time()
-    model_path = Path(args.model)
-    dataset_path = Path(args.dataset)
-    results_path = Path(args.results)
-
-    debug(f"Loading decrypted dataset from {dataset_path}")
-    dataset = json.loads(dataset_path.read_text(encoding="utf-8"))
-    features = np.asarray(dataset["features"], dtype=np.float32)
-    labels = np.asarray(dataset["labels"], dtype=np.int64)
-    debug(f"Dataset id={dataset.get('dataset_id')} description={dataset.get('description')}")
-    debug(f"Feature tensor shape={list(features.shape)} labels={len(labels)}")
-
-    debug(f"Creating ONNX Runtime session for {model_path}")
-    debug(f"Model SHA256={sha256_file(model_path)}")
-    external_weights = model_path.parent / "model.onnx.data"
-    if external_weights.exists():
-        debug(f"External weights SHA256={sha256_file(external_weights)}")
-    else:
-        raise FileNotFoundError(f"External weights file missing: {external_weights}")
-
-    import onnx
-    onnx_model = onnx.load(str(model_path), load_external_data=True)
-    session = ort.InferenceSession(onnx_model.SerializeToString(), providers=["CPUExecutionProvider"])
-    input_meta = session.get_inputs()[0]
-    input_name = input_meta.name
-    output_names = [output.name for output in session.get_outputs()]
-    debug(f"ONNX input={input_name} shape={input_meta.shape} outputs={output_names}")
-
-    batch_size = 8
-    logits_batches = []
-    for offset in range(0, len(features), batch_size):
-        batch = features[offset : offset + batch_size]
-        debug(f"Running inference batch offset={offset} size={len(batch)}")
-        logits = session.run(output_names, {input_name: batch})[0]
-        logits_batches.append(np.asarray(logits))
-
-    logits = np.concatenate(logits_batches, axis=0)
-    predictions = logits.argmax(axis=1).astype(np.int64)
-    accuracy = float((predictions == labels).mean()) if len(labels) else 0.0
-    max_seen_class = int(max(predictions.max(initial=0), labels.max(initial=0)))
-    declared_classes = int(dataset.get("num_classes") or 0)
-    matrix_size = max(declared_classes, max_seen_class + 1)
-    confusion = np.zeros((matrix_size, matrix_size), dtype=np.int64)
-    for truth, predicted in zip(labels, predictions):
-        confusion[int(truth), int(predicted)] += 1
-
-    distribution = {
-        str(class_id): int((predictions == class_id).sum())
-        for class_id in range(matrix_size)
-    }
-    results = {
-        "status": "success",
-        "dataset_id": dataset.get("dataset_id"),
-        "dataset_description": dataset.get("description"),
-        "num_samples": int(len(labels)),
-        "num_classes": int(matrix_size),
-        "accuracy": accuracy,
-        "prediction_distribution": distribution,
-        "confusion_matrix": confusion.tolist(),
-        "onnx_runtime_providers": session.get_providers(),
-        "onnx_input_name": input_name,
-        "onnx_output_names": output_names,
-        "logits_shape": list(logits.shape),
-        "elapsed_seconds": round(time.time() - started, 4),
-    }
-
-    results_path.parent.mkdir(parents=True, exist_ok=True)
-    results_path.write_text(json.dumps(results, indent=2), encoding="utf-8")
-    debug(f"Results written to {results_path}")
+    cvm_debug(f"Images extracted to {extract_dir}")
+    return extract_dir
 
 
-if __name__ == "__main__":
-    main()
-'''
+def fetch_evaluation_script(dataset_id: int) -> Path:
+    """
+    Pull the correct evaluation script from GCS for the given dataset_id.
+    dataset 1 = breast cancer  →  evaluate_model_breastcancer.py
+    dataset 2 = OCS            →  evaluate_model_OCS.py
+    Returns the local path where the script was written.
+    """
     _ensure_cvm_dirs()
-    if CVM_EVALUATION_SCRIPT.exists() and CVM_EVALUATION_SCRIPT.read_text(encoding="utf-8") == script:
-        cvm_debug(f"Evaluation script already present at {CVM_EVALUATION_SCRIPT}")
-        return CVM_EVALUATION_SCRIPT
+    dataset_cfg = config.get_dataset_gcp_config(dataset_id)
+    gcs_object  = dataset_cfg["eval_script_object"]
+    bucket      = config.gcp.eval_scripts_bucket
+    script_path = CVM_WORKFLOW_DIR / f"evaluation_script_{dataset_id}.py"
 
-    CVM_EVALUATION_SCRIPT.write_text(script, encoding="utf-8")
-    cvm_debug(f"Evaluation script written to {CVM_EVALUATION_SCRIPT}")
-    return CVM_EVALUATION_SCRIPT
+    cvm_debug(f"Fetching eval script for dataset_id={dataset_id} from gs://{bucket}/{gcs_object}")
+    download_gcs_object(bucket, gcs_object, str(script_path))
+    cvm_debug(f"Eval script written to {script_path}")
+    return script_path
 
 
-def run_evaluation_script_from_paths(model_path, dataset_path, results_path):
-    model_path = Path(model_path)
-    dataset_path = Path(dataset_path)
-    results_path = Path(results_path)
-    weights_path = model_path.parent / WEIGHTS_FILE_NAME
+def run_evaluation_script_from_paths(model_path, dataset_path, results_path, eval_script_path,
+                                     preprocessing_path=None):
+    model_path       = Path(model_path)
+    dataset_path     = Path(dataset_path)
+    results_path     = Path(results_path)
+    eval_script_path = Path(eval_script_path)
+    weights_path     = model_path.parent / WEIGHTS_FILE_NAME
+
     if not model_path.exists():
         raise FileNotFoundError(f"Model file not found: {model_path}")
     if not weights_path.exists():
         raise FileNotFoundError(f"External ONNX weights file not found: {weights_path}")
+    if not eval_script_path.exists():
+        raise FileNotFoundError(f"Evaluation script not found: {eval_script_path}")
 
-    ensure_evaluation_script()
-    cvm_debug(f"Compiling ONNX model by creating ONNX Runtime session in {CVM_EVALUATION_SCRIPT}")
+    cvm_debug(f"Running evaluation script: {eval_script_path}")
     cvm_debug(f"Model path: {model_path}")
     cvm_debug(f"Weights path: {weights_path}")
     cvm_debug(f"Dataset path: {dataset_path}")
+    if preprocessing_path:
+        cvm_debug(f"Preprocessing script: {preprocessing_path}")
 
     env = os.environ.copy()
     vendor_path = str(Path(config.base_dir) / ".vendor")
     env["PYTHONPATH"] = vendor_path + os.pathsep + env.get("PYTHONPATH", "")
 
+    cmd = [
+        sys.executable,
+        str(eval_script_path),
+        "--model",   str(model_path),
+        "--dataset", str(dataset_path),
+        "--results", str(results_path),
+    ]
+    if preprocessing_path and Path(preprocessing_path).exists():
+        cmd += ["--preprocessing", str(preprocessing_path)]
+
     result = subprocess.run(
-        [
-            sys.executable,
-            str(CVM_EVALUATION_SCRIPT),
-            "--model",
-            str(model_path),
-            "--dataset",
-            str(dataset_path),
-            "--results",
-            str(results_path),
-        ],
+        cmd,
         cwd=config.base_dir,
         capture_output=True,
         text=True,
@@ -772,14 +758,389 @@ def run_evaluation_script_from_paths(model_path, dataset_path, results_path):
     return results_path, results
 
 
-def run_evaluation_script(confirmation, dataset_path):
+def run_evaluation_script(confirmation, dataset_path, eval_script_path):
     model_path = CVM_ARTIFACTS_DIR / confirmation["model"]
     results_path = CVM_RUNTIME_DIR / "results.json"
-    return run_evaluation_script_from_paths(model_path, dataset_path, results_path)
+    return run_evaluation_script_from_paths(model_path, dataset_path, results_path, eval_script_path)
 
 
 def _job_dir(job_id):
     return CVM_SECURE_JOBS_DIR / job_id
+
+
+# ── Key store helpers ─────────────────────────────────────────────────────────
+
+_KEY_STORE_URL = "http://127.0.0.1:8081/api/get-key"
+
+
+def _fetch_model_key(job_id: str):
+    """Return raw 32-byte AES-256 key from the in-process key store, or None if absent."""
+    try:
+        resp = requests.get(_KEY_STORE_URL, params={"job_id": job_id}, timeout=5)
+        if resp.status_code == 404:
+            return None
+        resp.raise_for_status()
+        key_b64 = resp.json()["key_b64"]
+        return base64.b64decode(key_b64)
+    except Exception as exc:
+        cvm_debug(f"Key store lookup failed for job_id={job_id}: {exc}")
+        return None
+
+
+def _delete_model_key(job_id: str) -> None:
+    """Zero and remove the AES key from the key store after use."""
+    try:
+        requests.delete(_KEY_STORE_URL, params={"job_id": job_id}, timeout=5)
+    except Exception as exc:
+        cvm_debug(f"Key store delete failed for job_id={job_id}: {exc}")
+
+
+def _decrypt_aes_gcm(key_bytes: bytes, encrypted_b64: str, aad: bytes) -> bytes:
+    """
+    Decrypt AES-256-GCM ciphertext.
+
+    Wire format (Buffer TEE → Processing TEE):
+        base64( nonce[12] || ciphertext )
+    AAD is the job_id bytes — prevents ciphertext from being reused across jobs.
+    """
+    raw = base64.b64decode(encrypted_b64)
+    if len(raw) < 12 + 16:  # nonce + min GCM tag
+        raise ValueError(f"Encrypted blob too short: {len(raw)} bytes")
+    nonce = raw[:12]
+    ciphertext = raw[12:]
+    aesgcm = AESGCM(key_bytes)
+    return aesgcm.decrypt(nonce, ciphertext, aad)
+
+
+# ── Attestation JWT helpers ────────────────────────────────────────────────────
+
+_ATTESTATION_AUDIENCE = "https://tanuh-processing-tee"
+# Confidential Space launcher token server (unix socket). This is the ONLY
+# source of the real attestation token carrying hwmodel/swname/image_digest/
+# secboot. The metadata-server identity token (get_oidc_token) does NOT contain
+# these claims.
+_CS_TEESERVER_SOCKET = "/run/container_launcher/teeserver.sock"
+# Fixed nonce (10–74 chars) — we read claims, not channel-bind, so any valid
+# nonce works; it just appears as eat_nonce in the token.
+_CS_ATTESTATION_NONCE = "tanuh-leaderboard-attestation-nonce"
+
+
+def _decode_jwt_payload(token: str) -> dict:
+    """Decode the payload of a JWT without verifying the signature."""
+    try:
+        parts = token.split(".")
+        if len(parts) != 3:
+            return {}
+        padded = parts[1] + "=" * (4 - len(parts[1]) % 4)
+        return json.loads(base64.urlsafe_b64decode(padded))
+    except Exception:
+        return {}
+
+
+class _UnixHTTPConnection(http.client.HTTPConnection):
+    """HTTPConnection over a unix-domain socket (for the CS teeserver)."""
+
+    def __init__(self, socket_path: str, timeout: int = 10):
+        super().__init__("localhost", timeout=timeout)
+        self._socket_path = socket_path
+
+    def connect(self):
+        sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        sock.settimeout(self.timeout)
+        sock.connect(self._socket_path)
+        self.sock = sock
+
+
+def _fetch_cs_attestation_token() -> str:
+    """
+    Fetch the Confidential Space attestation OIDC token from the launcher's
+    token server over its unix socket:
+        POST /v1/token  {audience, nonces:[...], token_type:"OIDC"}
+    The response body is the raw JWT. Raises on failure (caller falls back).
+    """
+    body = json.dumps({
+        "audience": _ATTESTATION_AUDIENCE,
+        "nonces": [_CS_ATTESTATION_NONCE],
+        "token_type": "OIDC",
+    })
+    conn = _UnixHTTPConnection(_CS_TEESERVER_SOCKET, timeout=10)
+    try:
+        conn.request("POST", "/v1/token", body=body,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        data = resp.read().decode("utf-8", errors="replace").strip()
+        if resp.status != 200:
+            raise RuntimeError(f"teeserver /v1/token returned {resp.status}: {data[:200]}")
+        return data
+    finally:
+        conn.close()
+
+
+def _fetch_attestation_claims() -> dict:
+    """
+    Extract Confidential Space attestation claims (hwmodel, swname,
+    image_digest, secboot, iss) from the CS launcher's attestation token.
+
+    Falls back to the metadata-server identity token if the CS socket is
+    unavailable (e.g. local/non-TEE testing) — that token lacks the CS claims,
+    so those fields come back blank, which is the best we can do off-TEE.
+    Returns an empty dict if no token can be obtained.
+    """
+    token = None
+    try:
+        token = _fetch_cs_attestation_token()
+    except Exception as exc:
+        cvm_debug(f"CS attestation token unavailable ({exc}); falling back to identity token")
+        try:
+            token = get_oidc_token(_ATTESTATION_AUDIENCE)
+        except Exception as exc2:
+            cvm_debug(f"Could not fetch any attestation token: {exc2}")
+            return {}
+
+    claims = _decode_jwt_payload(token)
+    if not claims:
+        cvm_debug("Attestation token could not be decoded")
+        return {}
+    container = claims.get("submods", {}).get("container", {})
+    return {
+        "hwmodel": claims.get("hwmodel", ""),
+        "swname": claims.get("swname", ""),
+        "swversion": claims.get("swversion", []),
+        "image_digest": container.get("image_digest", ""),
+        "image_reference": container.get("image_reference", ""),
+        "instance_id": claims.get("sub", ""),
+        "iat": claims.get("iat", 0),
+        "secboot": claims.get("secboot", False),
+        "iss": claims.get("iss", ""),
+    }
+
+
+# ── GCS results + leaderboard ─────────────────────────────────────────────────
+
+def _upload_results_to_gcs(job_id: str, results: dict) -> str:
+    """Upload results.json to gs://<results_bucket>/results/<job_id>/results.json."""
+    bucket = config.gcp.results_bucket
+    object_path = f"results/{job_id}/results.json"
+    payload = json.dumps(results, indent=2).encode("utf-8")
+    upload_gcs_object(bucket, object_path, payload)
+    gcs_uri = f"gs://{bucket}/{object_path}"
+    cvm_debug(f"Results uploaded to {gcs_uri}")
+    return gcs_uri
+
+
+def _safe_error_stage(exc: Exception) -> str:
+    """
+    Return a safe, user-facing error description that contains no TEE-internal
+    paths, no dataset content, and no stack frames. The full traceback is logged
+    to the serial port (cvm_debug / traceback.print_exc) which is only accessible
+    to the TEE operator, never returned to the submitting user.
+    """
+    name = type(exc).__name__
+    msg  = str(exc)
+
+    # Eval script subprocess failures only carry the exit code — safe to forward.
+    if "Evaluation script failed with exit code" in msg:
+        return msg
+
+    # Everything else: classify by exception type, never expose the message body.
+    stage_map = {
+        "FileNotFoundError":  "Pipeline error: required file not found during setup.",
+        "ValueError":         "Pipeline error: invalid value encountered during setup.",
+        "RuntimeError":       "Pipeline error: runtime error during evaluation.",
+        "TimeoutError":       "Pipeline error: operation timed out.",
+        "PermissionError":    "Pipeline error: permission denied during setup.",
+        "OSError":            "Pipeline error: OS error during setup.",
+    }
+    return stage_map.get(name, "Pipeline error: evaluation could not be completed.")
+
+
+def _upload_error_to_gcs(job_id: str, error_message: str, stage: str = "") -> str:
+    """
+    Publish a job failure to the SAME GCS location the Buffer TEE polls for
+    results (results/<job_id>/results.json). The Buffer TEE's existing
+    GET /buffer/jobs/<job_id>/results endpoint fetches this object from GCS and
+    relays it to the browser, so the error reaches the UI over the exact channel
+    used for successful results — no extra callback path is introduced.
+
+    Best-effort: never raises, so it cannot mask the original failure or block
+    shutdown.
+    """
+    if not job_id:
+        cvm_debug("Cannot upload error to GCS: empty job_id")
+        return ""
+    error_payload = {
+        "status": "error",
+        "job_id": job_id,
+    }
+    try:
+        bucket = config.gcp.results_bucket
+        object_path = f"results/{job_id}/results.json"
+        upload_gcs_object(bucket, object_path,
+                          json.dumps(error_payload, indent=2).encode("utf-8"))
+        gcs_uri = f"gs://{bucket}/{object_path}"
+        cvm_debug(f"Error report uploaded to {gcs_uri} for Buffer TEE/UI to fetch")
+        return gcs_uri
+    except Exception as exc:
+        cvm_debug(f"Failed to upload error report to GCS for {job_id}: {exc}")
+        return ""
+
+
+def _update_leaderboard(job_id: str, results: dict, attestation: dict) -> None:
+    """
+    Read-modify-write the leaderboard JSON at gs://<results_bucket>/leaderboard.json.
+    Appends one entry combining evaluation results with attestation claims.
+    """
+    bucket = config.gcp.results_bucket
+    lb_path = "leaderboard.json"
+
+    try:
+        existing = json.loads(download_gcs_object_bytes(bucket, lb_path))
+        entries = existing if isinstance(existing, list) else []
+    except Exception:
+        entries = []
+
+    entry = {
+        "job_id": job_id,
+        "submitted_at_unix": int(time.time()),
+        "dataset_id": results.get("dataset_id"),
+        "num_samples": results.get("num_samples"),
+        "accuracy": results.get("accuracy"),
+        "prediction_distribution": results.get("prediction_distribution"),
+        "model_sha256": results.get("model_sha256"),
+        "weights_sha256": results.get("weights_sha256"),
+        "elapsed_seconds": results.get("elapsed_seconds"),
+        "attestation": attestation,
+    }
+    entries.append(entry)
+
+    upload_gcs_object(bucket, lb_path, json.dumps(entries, indent=2).encode("utf-8"))
+    cvm_debug(f"Leaderboard updated in gs://{bucket}/{lb_path} ({len(entries)} entries total)")
+
+
+# ── External leaderboard (/submit-solution) ───────────────────────────────────
+
+# POST endpoint for the benchmark leaderboard. The real path is under
+# /leaderboard/ (the bare /submit-solution returns 405). Override via env.
+LEADERBOARD_SUBMIT_URL = os.getenv(
+    "LEADERBOARD_SUBMIT_URL",
+    "https://benchmark.tanuh.ai/leaderboard/submit-solution",
+)
+# Internal dataset_id → leaderboard vertical slug.
+_LEADERBOARD_DATASET_SLUG = {1: "breast_cancer", 2: "oral_cancer", 3: "glaucoma"}
+
+
+def _f2_from_precision_recall(p: float, r: float) -> float:
+    """F-beta=2 from precision/recall: 5pr / (4p + r). 0 when undefined."""
+    denom = 4.0 * p + r
+    return (5.0 * p * r / denom) if denom else 0.0
+
+
+def _leaderboard_metrics(dataset_id: int, metrics: dict) -> dict:
+    """
+    Map our internal metrics dict onto the leaderboard's per-vertical schema.
+    Fields we can't produce are omitted (left blank) rather than guessed.
+    """
+    m = metrics or {}
+    if dataset_id == 2:  # oral_cancer → OralCancerMetrics
+        out = {
+            "sensitivity": m.get("sensitivity"),
+            "specificity": m.get("specificity"),
+            "accuracy":    m.get("accuracy"),
+            "ppv":         m.get("ppv"),
+            "npv":         m.get("npv"),
+            "f2_score":    m.get("f2"),
+        }
+    elif dataset_id == 1:  # breast_cancer → BreastCancerMetrics
+        # weighted_f2 isn't emitted directly; derive it from per-class
+        # precision/recall weighted by class support when available.
+        weighted_f2 = m.get("weighted_f2")
+        per_class = m.get("per_class") or {}
+        if weighted_f2 is None and per_class:
+            total = 0
+            acc = 0.0
+            for c in per_class.values():
+                support = int(c.get("TP", 0)) + int(c.get("FN", 0))
+                total += support
+                acc += support * _f2_from_precision_recall(
+                    c.get("precision", 0.0), c.get("recall", 0.0)
+                )
+            weighted_f2 = (acc / total) if total else None
+        out = {
+            "accuracy":         m.get("accuracy"),
+            "macro_f2":         m.get("macro_f2"),
+            "weighted_f2":      weighted_f2,
+            "macro_f1":         m.get("macro_f1"),
+            "sensitivity":      m.get("macro_recall"),
+            "qwk":              m.get("qwk"),
+            "specificity":      m.get("macro_specificity"),
+            "npv":              m.get("macro_npv"),
+            "ppv":              m.get("macro_ppv"),
+            "confusion_matrix": m.get("confusion_matrix"),
+            "auc":              m.get("auc"),
+        }
+    else:
+        out = dict(m)
+    return {k: v for k, v in out.items() if v is not None}
+
+
+def _submit_to_leaderboard(job_id: str, results: dict, attestation: dict) -> None:
+    """
+    POST one evaluation result to the external leaderboard /submit-solution.
+
+    The leaderboard requires job_id to be a UUID and reads the caller identity
+    from the Bearer JWT's `sub` claim (signature not verified). We use the
+    Processing TEE's Confidential Space OIDC token as the Bearer.
+
+    Best-effort: never raises — the pipeline's success does not depend on it.
+    """
+    dataset_id = int(results.get("dataset_id") or 0)
+    slug = _LEADERBOARD_DATASET_SLUG.get(dataset_id)
+    if not slug:
+        cvm_debug(f"Leaderboard: no vertical for dataset_id={dataset_id}; skipping submit")
+        return
+
+    # Stable UUID derived from our internal job_id (endpoint requires a UUID).
+    lb_job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"tanuh:{job_id}"))
+
+    body = {
+        "job_id": lb_job_id,
+        "dataset_id": slug,
+        "num_samples": results.get("num_samples"),
+        "elapsed_seconds": results.get("elapsed_seconds"),
+        "model_sha256": results.get("model_sha256"),
+        "onnx_runtime_providers": results.get("onnx_runtime_providers", []),
+        "attestation": {
+            "hwmodel": attestation.get("hwmodel", ""),
+            "swname": attestation.get("swname", ""),
+            "image_digest": attestation.get("image_digest", ""),
+            "secboot": bool(attestation.get("secboot", False)),
+            "iss": attestation.get("iss", ""),
+        },
+        "metrics": _leaderboard_metrics(dataset_id, results.get("metrics", {})),
+    }
+
+    try:
+        token = get_oidc_token(_ATTESTATION_AUDIENCE)
+    except Exception as exc:
+        cvm_debug(f"Leaderboard: could not obtain Bearer token: {exc}; skipping submit")
+        return
+
+    try:
+        resp = requests.post(
+            LEADERBOARD_SUBMIT_URL,
+            json=body,
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=30,
+        )
+        if resp.status_code in (200, 201):
+            cvm_debug(f"Leaderboard: submitted job {job_id} ({slug}) → {resp.status_code}")
+        else:
+            cvm_debug(
+                f"Leaderboard: submit for job {job_id} returned "
+                f"{resp.status_code}: {resp.text[:300]}"
+            )
+    except Exception as exc:
+        cvm_debug(f"Leaderboard: submit failed for job {job_id} (non-fatal): {exc}")
 
 
 def _materialize_secure_job_payload(payload):
@@ -790,7 +1151,6 @@ def _materialize_secure_job_payload(payload):
         "model_weights_base64",
         "model_sha256",
         "weights_sha256",
-        "buffer_results_callback_url",
     }
     missing = required_fields - set(payload.keys())
     if missing:
@@ -805,8 +1165,20 @@ def _materialize_secure_job_payload(payload):
 
     model_path = artifacts_dir / payload.get("model_file", MODEL_FILE_NAME)
     weights_path = artifacts_dir / payload.get("weights_file", WEIGHTS_FILE_NAME)
-    model_bytes = base64.b64decode(payload["model_onnx_base64"])
-    weights_bytes = base64.b64decode(payload["model_weights_base64"])
+
+    # Try to retrieve the per-job AES-256 key deposited by the Buffer TEE via RA-TLS.
+    # If no key is present (e.g. during local testing), treat the base64 fields as plaintext.
+    aes_key = _fetch_model_key(job_id)
+    if aes_key is not None:
+        cvm_debug(f"AES-256 key found for job_id={job_id}; decrypting model bytes")
+        aad = job_id.encode("utf-8")
+        model_bytes = _decrypt_aes_gcm(aes_key, payload["model_onnx_base64"], aad)
+        weights_bytes = _decrypt_aes_gcm(aes_key, payload["model_weights_base64"], aad)
+        _delete_model_key(job_id)
+    else:
+        cvm_debug(f"No AES key in store for job_id={job_id}; treating model fields as plaintext base64")
+        model_bytes = base64.b64decode(payload["model_onnx_base64"])
+        weights_bytes = base64.b64decode(payload["model_weights_base64"])
 
     if hashlib.sha256(model_bytes).hexdigest() != payload["model_sha256"]:
         raise ValueError("model.onnx SHA256 mismatch in secure payload")
@@ -815,6 +1187,30 @@ def _materialize_secure_job_payload(payload):
 
     model_path.write_bytes(model_bytes)
     weights_path.write_bytes(weights_bytes)
+
+    # Extract user preprocessing script if provided (Oral Cancer jobs)
+    preprocessing_path = None
+    preprocessing_b64 = payload.get("preprocessing_script_base64")
+    if preprocessing_b64:
+        preprocessing_bytes = base64.b64decode(preprocessing_b64)
+        preprocessing_sha256_expected = payload.get("preprocessing_sha256", "")
+        if preprocessing_sha256_expected and hashlib.sha256(preprocessing_bytes).hexdigest() != preprocessing_sha256_expected:
+            raise ValueError("preprocessing.py SHA256 mismatch in secure payload")
+        preprocessing_path = artifacts_dir / "preprocessing.py"
+        preprocessing_path.write_bytes(preprocessing_bytes)
+        cvm_debug(f"preprocessing.py written to {preprocessing_path} ({len(preprocessing_bytes)} bytes)")
+
+        # Scan preprocessing script for missing deps and install via UV.
+        # Raises RuntimeError (caught by run_secure_job_pipeline) on install failure,
+        # so the job is marked error with the exact uv output rather than a
+        # confusing ImportError later inside the eval subprocess.
+        from dep_scanner import install_missing_deps
+        cvm_debug("Scanning preprocessing.py for missing dependencies...")
+        installed, skipped = install_missing_deps(preprocessing_path)
+        if installed:
+            cvm_debug(f"UV installed: {installed}")
+        cvm_debug(f"UV skipped (stdlib/image/present): {len(skipped)} packages")
+
     _json_dump(job_dir / "incoming_payload.json", payload)
     cvm_debug(f"Secure job payload materialized under {job_dir}")
     return {
@@ -823,7 +1219,7 @@ def _materialize_secure_job_payload(payload):
         "runtime_dir": runtime_dir,
         "model_path": model_path,
         "weights_path": weights_path,
-        "buffer_results_callback_url": payload["buffer_results_callback_url"],
+        "preprocessing_path": preprocessing_path,
         "dataset_id": int(payload["dataset_id"]),
         "hyperparameters": payload.get("hyperparameters", {}),
     }
@@ -842,19 +1238,31 @@ def run_secure_job_pipeline(payload):
         last_job_id=job_id,
         last_error="",
     )
-    cvm_debug(f"Secure job {job_id}: starting dataset selection for dataset_id={dataset_id}")
+    cvm_debug(f"Secure job {job_id}: starting pipeline for dataset_id={dataset_id}")
 
+    # Step 1: fetch encrypted dataset JSON from GCS and decrypt
     dataset_path = decrypt_selected_dataset(dataset_id)
     job_dataset_path = runtime_dir / dataset_path.name
     shutil.copy2(dataset_path, job_dataset_path)
-    cvm_debug(f"Secure job {job_id}: dataset copied to {job_dataset_path}")
+    cvm_debug(f"Secure job {job_id}: dataset decrypted and copied to {job_dataset_path}")
 
+    # Step 2: fetch encrypted image zip from GCS, decrypt, and extract
+    cvm_debug(f"Secure job {job_id}: fetching and extracting images for dataset_id={dataset_id}")
+    fetch_and_extract_images(dataset_id)
+
+    # Step 3: pull the correct evaluation script from GCS for this dataset
+    eval_script_path = fetch_evaluation_script(dataset_id)
+    cvm_debug(f"Secure job {job_id}: eval script fetched to {eval_script_path}")
+
+    # Step 4: run evaluation
     results_path = runtime_dir / "results.json"
     cvm_debug(f"Secure job {job_id}: evaluating ONNX model with runtime results at {results_path}")
     _, results = run_evaluation_script_from_paths(
         model_path=job_materialized["model_path"],
         dataset_path=job_dataset_path,
         results_path=results_path,
+        eval_script_path=eval_script_path,
+        preprocessing_path=job_materialized.get("preprocessing_path"),
     )
     results["job_id"] = job_id
     results["model_sha256"] = _sha256_file(job_materialized["model_path"])
@@ -863,16 +1271,22 @@ def run_secure_job_pipeline(payload):
     _json_dump(results_path, results)
     cvm_debug(f"Secure job {job_id}: local results saved to {results_path}")
 
-    callback_url = job_materialized["buffer_results_callback_url"]
-    cvm_debug(f"Secure job {job_id}: POSTing results back to Buffer TEE at {callback_url}")
-    response = requests.post(
-        callback_url,
-        json=results,
-        timeout=60,
-        verify=os.getenv("BUFFER_RESULTS_VERIFY_TLS", "0") == "1",
-    )
-    response.raise_for_status()
-    cvm_debug(f"Secure job {job_id}: Buffer TEE acknowledged results with {response.status_code}")
+    # Fetch attestation claims from the Confidential Space OIDC token.
+    cvm_debug(f"Secure job {job_id}: fetching attestation claims for leaderboard")
+    attestation = _fetch_attestation_claims()
+
+    # Upload results to GCS. Buffer TEE will poll GCS directly — no callback needed.
+    gcs_results_uri = ""
+    try:
+        gcs_results_uri = _upload_results_to_gcs(job_id, results)
+        cvm_debug(f"Secure job {job_id}: results uploaded to {gcs_results_uri}")
+    except Exception as exc:
+        cvm_debug(f"Secure job {job_id}: GCS results upload failed (non-fatal): {exc}")
+
+    try:
+        _submit_to_leaderboard(job_id, results, attestation)
+    except Exception as exc:
+        cvm_debug(f"Secure job {job_id}: leaderboard submit failed (non-fatal): {exc}")
 
     _set_secure_job_state(
         status="complete",
@@ -886,6 +1300,8 @@ def run_secure_job_pipeline(payload):
         "status": "success",
         "job_id": job_id,
         "results_path": str(results_path),
+        "gcs_results_uri": gcs_results_uri,
+        "attestation": attestation,
         "results": results,
     }
 
@@ -935,8 +1351,10 @@ def run_google_cvm_workflow(confirmation_timeout=30, clear_runtime=False):
             "title": "Decrypting Selected Dataset",
             "description": "Using placeholder dataset_keys.json instead of Secret Manager",
         }
-        cvm_debug("Step 3/4: Pull encrypted dataset and decrypt selected dataset")
-        dataset_path = decrypt_selected_dataset(int(confirmation["dataset_id"]))
+        cvm_debug("Step 3/4: Pull encrypted dataset JSON, images, and eval script")
+        dataset_id   = int(confirmation.get("dataset_id", 1))
+        dataset_path = decrypt_selected_dataset(dataset_id)
+        fetch_and_extract_images(dataset_id)
 
         state = {
             "step": 4,
@@ -945,7 +1363,8 @@ def run_google_cvm_workflow(confirmation_timeout=30, clear_runtime=False):
             "description": "Running ONNX Runtime evaluation script",
         }
         cvm_debug("Step 4/4: Compile ONNX model, load external weights, evaluate, and write results")
-        results_path, results = run_evaluation_script(confirmation, dataset_path)
+        eval_script_path = fetch_evaluation_script(dataset_id)
+        results_path, results = run_evaluation_script(confirmation, dataset_path, eval_script_path)
 
         state = {
             "step": 4,
@@ -1375,19 +1794,31 @@ def receive_secure_job():
             return jsonify({"status": "error", "message": str(exc)}), 400
 
     def _runner():
+        job_id = content.get("job_id", "")
         try:
             run_secure_job_pipeline(content)
         except Exception as exc:
+            # Log full traceback to serial port only — never sent outside the TEE.
             traceback.print_exc()
-            cvm_debug(f"Secure job {content.get('job_id')} failed: {exc}")
+            cvm_debug(f"Secure job {job_id} failed: {exc}")
             _set_secure_job_state(
                 status="error",
                 current_job_id="",
-                last_job_id=content.get("job_id", ""),
+                last_job_id=job_id,
                 last_error=str(exc),
             )
+            # Publish a sanitized failure notice to GCS.
+            # Tracebacks and raw exception messages are intentionally excluded:
+            # they may contain TEE-internal paths or, in the case of a malicious
+            # preprocessing script, dataset content embedded in exception text.
+            safe_stage = _safe_error_stage(exc)
+            _upload_error_to_gcs(
+                job_id,
+                error_message=safe_stage,
+                stage="secure_job_pipeline",
+            )
             if PROCESSING_DEALLOCATE_AFTER_JOB:
-                request_vm_deallocation(f"job {content.get('job_id')} failed: {exc}")
+                request_vm_deallocation(f"job {job_id} failed: {exc}")
 
     thread = threading.Thread(
         target=_runner,
@@ -1405,6 +1836,14 @@ def receive_secure_job():
             "thread_name": thread.name,
         }
     ), 202
+
+
+@app.route("/enclave/cvm/results-stub", methods=["POST"])
+def results_stub():
+    """Test callback endpoint — accepts results POSTed by run_secure_job_pipeline during local testing."""
+    content = request.json or {}
+    cvm_debug(f"results-stub received callback for job_id={content.get('job_id')} accuracy={content.get('accuracy')}")
+    return jsonify({"status": "received", "job_id": content.get("job_id")}), 200
 
 
 @app.route("/enclave/cvm/runtime-state", methods=["GET"])
@@ -1651,4 +2090,4 @@ if __name__ == "__main__":
     print("=" * 60)
     _ensure_cvm_dirs()
     start_idle_deallocator_thread()
-    app.run(host=config.service.host, port=config.service.port, debug=True)
+    app.run(host=config.service.host, port=config.service.port, debug=True, use_reloader=False)
