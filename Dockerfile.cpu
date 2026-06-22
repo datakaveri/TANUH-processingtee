@@ -1,0 +1,87 @@
+FROM ghcr.io/astral-sh/uv:0.7.0 AS uv-source
+
+FROM golang:1.22-bullseye AS ratls-builder
+WORKDIR /src
+COPY b2p-ratls/go.mod b2p-ratls/go.sum ./b2p-ratls/
+WORKDIR /src/b2p-ratls
+RUN go mod download
+COPY b2p-ratls/ ./
+RUN CGO_ENABLED=0 GOOS=linux go build -o /out/gpu-cs ./cmd/gpu-cs/
+
+# CPU-only Processing TEE image — the fallback used when the GPU VM cannot be
+# provisioned (quota, zone stockout, driver-install failure). Plain Ubuntu base,
+# no CUDA. onnxruntime runs on CPUExecutionProvider. The RA-TLS server binary,
+# enclave manager, eval code, and entrypoint are identical to the GPU image;
+# only the base image and the wheel set differ.
+FROM ubuntu:22.04
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONPATH=/app \
+    BASE_DIR=/app \
+    DEBIAN_FRONTEND=noninteractive \
+    RATLS_AUDIENCE=ratls-buffer-tee \
+    LISTEN_ADDR=:443 \
+    INTERNAL_ADDR=127.0.0.1:8081 \
+    PROCESSING_MANAGER_JOB_URL=http://127.0.0.1:4000/enclave/cvm/secure-job
+
+# INSTANCE/ZONE/PROJECT are allowed as env overrides so the self-deallocation
+# stop script (stop-processing-vm.sh, which defaults INSTANCE=gpu-cs-tdx-h100)
+# can be retargeted to THIS CPU VM (cpu-cs-snp). Without this, an idle/post-job
+# CPU VM would issue a stop against the GPU instance instead of itself.
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,INTERNAL_ADDR,PROCESSING_MANAGER_JOB_URL,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,INSTANCE,ZONE,PROJECT"
+LABEL "tee.launch_policy.allow_cmd_override"="false"
+
+WORKDIR /app
+
+# python3.11 from deadsnakes to match the GPU image runtime (3.11),
+# plus build deps for native wheels (pydicom/pylibjpeg/opencv).
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        software-properties-common \
+        ca-certificates \
+        curl \
+        gnupg \
+    && add-apt-repository -y ppa:deadsnakes/ppa \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        python3.11 \
+        python3.11-venv \
+        python3.11-dev \
+        build-essential \
+        libgomp1 \
+        libgl1 \
+        libglib2.0-0 \
+    && curl -sS https://bootstrap.pypa.io/get-pip.py | python3.11 \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python \
+    && ln -sf /usr/bin/python3.11 /usr/local/bin/python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# UV binary — used at runtime to install user preprocessing script dependencies
+COPY --from=uv-source /uv /bin/uv
+
+COPY requirements.cpu.txt /tmp/requirements.txt
+# Step 1: install everything except JAX.
+# torch/torchvision/torchaudio use the CPU wheel index; the rest come from PyPI.
+# --ignore-installed blinker: Ubuntu base ships a distutils-installed blinker 1.4
+# that pip cannot cleanly remove.
+RUN python -m pip install --upgrade pip \
+    && python -m pip install \
+        --extra-index-url https://download.pytorch.org/whl/cpu \
+        --ignore-installed blinker \
+        -r /tmp/requirements.txt
+
+# Step 2: install the CPU build of JAX. Unlike jax[cuda12], jax[cpu] resolves
+# cleanly from PyPI with no special wheel index.
+RUN python -m pip install "jax[cpu]==0.4.35"
+
+COPY . /app
+COPY --from=ratls-builder /out/gpu-cs /usr/local/bin/gpu-cs
+
+RUN chmod +x /app/entrypoint.sh /usr/local/bin/gpu-cs \
+    && mkdir -p /app/cvm_workflow/artifacts /app/cvm_workflow/incoming /app/cvm_workflow/runtime /app/cvm_workflow/secure_jobs
+
+EXPOSE 4000 443
+
+ENTRYPOINT ["/app/entrypoint.sh"]
