@@ -48,20 +48,3 @@ jobs:
             ${{ env.IMAGE }}:latest | cut -d@ -f2)
           echo "digest=$DIGEST" >> $GITHUB_OUTPUT
           echo "Processing TEE digest: $DIGEST"
-
-      - name: Trigger browser-ratls digest update
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.BROWSER_RATLS_PAT }}
-          script: |
-            await github.rest.repos.createDispatchEvent({
-              owner: 'datakaveri',
-              repo:  'Tanuh-browser-ratls',
-              event_type: 'update-processing-tee-digest',
-              client_payload: {
-                digest:     '${{ steps.digest.outputs.digest }}',
-                component:  'processing-tee',
-                commit_sha: '${{ github.sha }}'
-              }
-            })
-            console.log('Triggered browser-ratls digest update')
