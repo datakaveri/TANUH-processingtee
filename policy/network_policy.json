@@ -1,0 +1,36 @@
+{
+  "version": "1.0",
+  "policy_name": "processing-tee-network-policy",
+
+  "rules": [
+    {
+      "action": "ALLOW",
+      "protocol": "tcp",
+      "ports": [443],
+      "destinations": [
+        "pypi.org",
+        "files.pythonhosted.org"
+      ],
+      "description": "Allow uv package downloads only"
+    },
+
+    {
+      "action": "DENY",
+      "protocol": "tcp",
+      "ports": [443],
+      "destinations": [
+        "upload.pypi.org"
+      ],
+      "description": "Block PyPI uploads"
+    },
+
+    {
+      "destination": "benchmark.tanuh.ai",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "DENY",
+      "upload": "ALLOW",
+      "description": "Allow benchmark uploads but deny benchmark downloads"
+    }
+  ]
+}

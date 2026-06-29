@@ -15,6 +15,8 @@ import requests
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
 from cryptography.fernet import Fernet
+from policy.policy_hash import calculate_policy_hash
+from policy.policy_hash import get_policy_hash
 
 from lib.config import config
 
@@ -305,6 +307,19 @@ def generate_nonce(size=32):
     nonce = secrets.token_bytes(size)
     return base64.urlsafe_b64encode(nonce).decode("utf-8")
 
+def generate_attestation_nonce():
+    """
+    Use the SHA256 hash of the network policy as the deployment nonce.
+    """
+
+    policy_hash = get_policy_hash()
+
+    print("\n================ POLICY ATTESTATION ================")
+    print(f"Policy SHA256 : {policy_hash}")
+    print("Using policy hash as deployment nonce.")
+    print("====================================================\n")
+
+    return policy_hash
 
 def save_nonce(nonce, path=None):
     if path is None:

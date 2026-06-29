@@ -14,6 +14,8 @@ import logging
 import threading
 import traceback
 from pathlib import Path
+from policy.policy_hash import get_policy_hash
+from policy.policy_loader import load_policy
 
 _LOCAL_VENDOR = Path(__file__).resolve().parent / ".vendor"
 if _LOCAL_VENDOR.exists() and str(_LOCAL_VENDOR) not in sys.path:
@@ -1581,7 +1583,17 @@ def get_fresh_jwt():
         
         # new nonce generated every time a fresh endpoint is hit
         print("Generating fresh deployment nonce...")
-        nonce = P3DX_SDK.generate_nonce()                  
+        nonce = P3DX_SDK.generate_attestation_nonce()   
+
+        policy = load_policy()
+
+        print("\n================ ACTIVE NETWORK POLICY ================")
+
+        for rule in policy["rules"]:
+             print(rule)
+
+        print("======================================================\n")
+
         P3DX_SDK.save_nonce(nonce)
         P3DX_SDK.extend_nonce_to_pcr8(nonce)
         print(f"Generated deployment nonce: {nonce}")
@@ -1602,20 +1614,51 @@ def get_fresh_jwt():
         
         with open(jwt_file_path, "r") as f:
             jwt_token = f.read().strip()
-        
+
+            print("\n================ GENERATED JWT ================")
+            print(jwt_token)
+            print("===============================================\n")
+
         if not jwt_token:
             response = {
                 "title": "Error: Empty JWT",
                 "description": "JWT token file is empty after generation."
             }
             return jsonify(response), 500
-        
+
+        policy_hash = get_policy_hash()
+        policy = load_policy()
+
+        print("\n" + "=" * 70)
+        print("NETWORK POLICY")
+        print("=" * 70)
+        print(f"Policy SHA256 : {policy_hash}")
+
+        print("\nConfigured Rules:")
+
+        for i, rule in enumerate(policy["rules"], start=1):
+            print(f"\n[{i}] {rule['description']}")
+            print(f"    Action      : {rule['action']}")
+            print(f"    Destination : {', '.join(rule['destinations'])}")
+            print(f"    Ports       : {rule['ports']}")
+
+            if "download" in rule:
+                print(f"    Download    : {rule['download']}")
+
+            if "upload" in rule:
+                print(f"    Upload      : {rule['upload']}")
+
+        print("=" * 70)
+        print(f"Policy hash bound into attestation nonce: {policy_hash}")
+        print("=" * 70 + "\n")
+
         print(f"Fresh JWT token generated successfully (length: {len(jwt_token)})")
-        
+
         response = {
             "title": "Success",
             "jwt": jwt_token
         }
+
         return jsonify(response), 200
         
     except RuntimeError as e:
