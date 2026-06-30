@@ -928,6 +928,49 @@ def _upload_results_to_gcs(job_id: str, results: dict) -> str:
     return gcs_uri
 
 
+def _sanitize_error_msg(msg: str) -> str:
+    """Strip filesystem paths from an error message before external reporting."""
+    import re as _re
+    return _re.sub(r"/[^\s\"']+", "<path>", msg)
+
+
+def _classify_leaderboard_error(exc: Exception) -> tuple:
+    """
+    Returns (error_code, error_type, error_message).
+
+    error_code:
+      1 = user-supplied code (preprocessing script / model loading)
+      2 = our eval scripts / dataloader / model population
+      3 = environment (CUDA / GPU / GCS / Secret Manager / network)
+    """
+    import re as _re
+    msg  = str(exc)
+    name = type(exc).__name__
+
+    # Map eval subprocess exit codes to error categories.
+    m = _re.search(r"Evaluation script failed with exit code (\d+)", msg)
+    if m:
+        code = int(m.group(1))
+        if code == 10:
+            return 1, "EvalUserCodeError", "Preprocessing script failed to load or execute."
+        if code == 11:
+            return 3, "EvalEnvironmentError", "CUDA/GPU runtime error in evaluation script."
+        return 2, "EvalScriptError", f"Evaluation script exited with code {code}."
+
+    # Environment / infrastructure indicators.
+    env_keywords = ("cuda", "gpu", "nvidia", "cudnn", "onnxruntime",
+                    "gcs", "secret manager", "connection", "timeout",
+                    "no space", "out of memory", "oom")
+    if any(kw in msg.lower() for kw in env_keywords):
+        return 3, name, _sanitize_error_msg(msg)
+
+    if name in ("FileNotFoundError", "PermissionError", "OSError"):
+        return 3, name, _sanitize_error_msg(msg)
+
+    # Default: our pipeline.
+    return 2, name, _sanitize_error_msg(msg)
+
+
 def _safe_error_stage(exc: Exception) -> str:
     """
     Return a safe, user-facing error description that contains no TEE-internal
@@ -1083,41 +1126,54 @@ def _leaderboard_metrics(dataset_id: int, metrics: dict) -> dict:
     return {k: v for k, v in out.items() if v is not None}
 
 
-def _submit_to_leaderboard(job_id: str, results: dict, attestation: dict) -> None:
+def _submit_to_leaderboard(job_id: str, dataset_id: int, attestation: dict,
+                           status: str = "succeeded",
+                           results: dict = None,
+                           error: dict = None,
+                           submitted_by: str = "") -> None:
     """
     POST one evaluation result to the external leaderboard /submit-solution.
 
-    The leaderboard requires job_id to be a UUID and reads the caller identity
-    from the Bearer JWT's `sub` claim (signature not verified). We use the
-    Processing TEE's Confidential Space OIDC token as the Bearer.
+    status="succeeded": sends full metrics payload.
+    status="failed":    sends error payload (no metrics).
 
     Best-effort: never raises — the pipeline's success does not depend on it.
     """
-    dataset_id = int(results.get("dataset_id") or 0)
     slug = _LEADERBOARD_DATASET_SLUG.get(dataset_id)
     if not slug:
         cvm_debug(f"Leaderboard: no vertical for dataset_id={dataset_id}; skipping submit")
         return
 
-    # Stable UUID derived from our internal job_id (endpoint requires a UUID).
     lb_job_id = str(uuid.uuid5(uuid.NAMESPACE_URL, f"tanuh:{job_id}"))
-
-    body = {
-        "job_id": lb_job_id,
-        "dataset_id": slug,
-        "num_samples": results.get("num_samples"),
-        "elapsed_seconds": results.get("elapsed_seconds"),
-        "model_sha256": results.get("model_sha256"),
-        "onnx_runtime_providers": results.get("onnx_runtime_providers", []),
-        "attestation": {
-            "hwmodel": attestation.get("hwmodel", ""),
-            "swname": attestation.get("swname", ""),
-            "image_digest": attestation.get("image_digest", ""),
-            "secboot": bool(attestation.get("secboot", False)),
-            "iss": attestation.get("iss", ""),
-        },
-        "metrics": _leaderboard_metrics(dataset_id, results.get("metrics", {})),
+    attestation_body = {
+        "hwmodel":      attestation.get("hwmodel", ""),
+        "swname":       attestation.get("swname", ""),
+        "image_digest": attestation.get("image_digest", ""),
+        "secboot":      bool(attestation.get("secboot", False)),
+        "iss":          attestation.get("iss", ""),
     }
+
+    if status == "succeeded" and results:
+        body = {
+            "job_id":                 lb_job_id,
+            "dataset_id":             slug,
+            "status":                 "succeeded",
+            "num_samples":            results.get("num_samples"),
+            "elapsed_seconds":        results.get("elapsed_seconds"),
+            "model_sha256":           results.get("model_sha256"),
+            "onnx_runtime_providers": results.get("onnx_runtime_providers", []),
+            "attestation":            attestation_body,
+            "metrics":                _leaderboard_metrics(dataset_id, results.get("metrics", {})),
+        }
+    else:
+        body = {
+            "job_id":      lb_job_id,
+            "dataset_id":  slug,
+            "status":      "failed",
+            "attestation": attestation_body,
+        }
+        if error:
+            body["error"] = error
 
     try:
         token = get_oidc_token(_ATTESTATION_AUDIENCE)
@@ -1133,7 +1189,7 @@ def _submit_to_leaderboard(job_id: str, results: dict, attestation: dict) -> Non
             timeout=30,
         )
         if resp.status_code in (200, 201):
-            cvm_debug(f"Leaderboard: submitted job {job_id} ({slug}) → {resp.status_code}")
+            cvm_debug(f"Leaderboard: {status} submitted for job {job_id} ({slug}) → {resp.status_code}")
         else:
             cvm_debug(
                 f"Leaderboard: submit for job {job_id} returned "
@@ -1211,6 +1267,7 @@ def _materialize_secure_job_payload(payload):
         "preprocessing_path": preprocessing_path,
         "dataset_id": int(payload["dataset_id"]),
         "hyperparameters": payload.get("hyperparameters", {}),
+        "submitted_by": payload.get("submitted_by", ""),
     }
 
 
@@ -1220,6 +1277,7 @@ def run_secure_job_pipeline(payload):
     job_id = job_materialized["job_id"]
     runtime_dir = job_materialized["runtime_dir"]
     dataset_id = int(job_materialized["dataset_id"])
+    submitted_by = job_materialized.get("submitted_by", "")
 
     _set_secure_job_state(
         status="running",
@@ -1273,7 +1331,9 @@ def run_secure_job_pipeline(payload):
         cvm_debug(f"Secure job {job_id}: GCS results upload failed (non-fatal): {exc}")
 
     try:
-        _submit_to_leaderboard(job_id, results, attestation)
+        _submit_to_leaderboard(job_id, dataset_id, attestation,
+                               status="succeeded", results=results,
+                               submitted_by=submitted_by)
     except Exception as exc:
         cvm_debug(f"Secure job {job_id}: leaderboard submit failed (non-fatal): {exc}")
 
@@ -1796,15 +1856,30 @@ def receive_secure_job():
                 last_job_id=job_id,
                 last_error=str(exc),
             )
-            # Publish a sanitized failure notice to GCS.
-            # Tracebacks and raw exception messages are intentionally excluded:
-            # they may contain TEE-internal paths or, in the case of a malicious
-            # preprocessing script, dataset content embedded in exception text.
+            # Publish a sanitized failure notice to GCS so the Buffer TEE can
+            # return an error status to the browser.
             safe_stage = _safe_error_stage(exc)
             _upload_error_to_gcs(
                 job_id,
                 error_message=safe_stage,
                 stage="secure_job_pipeline",
+            )
+            # Submit failure to leaderboard.
+            dataset_id = int(content.get("dataset_id", 0))
+            error_code, error_type, error_message = _classify_leaderboard_error(exc)
+            try:
+                attestation = _fetch_attestation_claims()
+            except Exception:
+                attestation = {}
+            _submit_to_leaderboard(
+                job_id, dataset_id, attestation,
+                status="failed",
+                submitted_by=content.get("submitted_by", ""),
+                error={
+                    "error_code":    error_code,
+                    "error_type":    error_type,
+                    "error_message": error_message,
+                },
             )
             if PROCESSING_DEALLOCATE_AFTER_JOB:
                 request_vm_deallocation(f"job {job_id} failed: {exc}")
