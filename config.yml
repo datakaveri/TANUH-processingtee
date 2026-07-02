@@ -91,7 +91,6 @@ gcp:
   project_id: p3dx-depa-sandbox
   datasets_bucket: tanuh-datasets
   eval_scripts_bucket: tanuh-eval-scripts
-  results_bucket: p3dx-tanuh-results
 
   # Maps dataset_id (as string) to:
   #   dataset_json_object  — AES-GCM encrypted JSON (paths + labels)
