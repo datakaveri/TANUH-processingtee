@@ -742,7 +742,8 @@ def _submit_to_leaderboard(job_id: str, dataset_id: int, attestation: dict,
                            status: str = "succeeded",
                            results: dict = None,
                            error: dict = None,
-                           submitted_by: str = "") -> None:
+                           submitted_by: str = "",
+                           keycloak_token: str = "") -> None:
     """
     POST one evaluation result to the external leaderboard /submit-solution.
 
@@ -787,17 +788,20 @@ def _submit_to_leaderboard(job_id: str, dataset_id: int, attestation: dict,
         if error:
             body["error"] = error
 
-    try:
-        token = get_oidc_token(_ATTESTATION_AUDIENCE)
-    except Exception as exc:
-        cvm_debug(f"Leaderboard: could not obtain Bearer token: {exc}; skipping submit")
+    # The leaderboard authenticates with the caller's Keycloak Bearer JWT (it
+    # extracts `sub` and requires the org_admin realm role). Only that token is
+    # accepted — the CS attestation token is NOT used here. If the browser did
+    # not forward a Keycloak token, skip the submit rather than send a token the
+    # leaderboard will reject.
+    if not keycloak_token:
+        cvm_debug(f"Leaderboard: no Keycloak token forwarded for job {job_id}; skipping submit")
         return
 
     try:
         resp = requests.post(
             LEADERBOARD_SUBMIT_URL,
             json=body,
-            headers={"Authorization": f"Bearer {token}"},
+            headers={"Authorization": f"Bearer {keycloak_token}"},
             timeout=30,
         )
         if resp.status_code in (200, 201):
@@ -937,7 +941,8 @@ def run_secure_job_pipeline(payload):
     try:
         _submit_to_leaderboard(job_id, dataset_id, attestation,
                                status="succeeded", results=results,
-                               submitted_by=submitted_by)
+                               submitted_by=submitted_by,
+                               keycloak_token=payload.get("keycloak_token", ""))
     except Exception as exc:
         cvm_debug(f"Secure job {job_id}: leaderboard submit failed (non-fatal): {exc}")
 
@@ -1013,6 +1018,7 @@ def receive_secure_job():
                 job_id, dataset_id, attestation,
                 status="failed",
                 submitted_by=content.get("submitted_by", ""),
+                keycloak_token=content.get("keycloak_token", ""),
                 error={
                     "error_code":    error_code,
                     "error_type":    error_type,
