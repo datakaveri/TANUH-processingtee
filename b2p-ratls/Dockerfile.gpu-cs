@@ -1,0 +1,17 @@
+FROM golang:1.22-bullseye AS builder
+WORKDIR /app
+COPY go.mod go.sum ./
+RUN go mod download
+COPY . .
+RUN CGO_ENABLED=0 GOOS=linux go build -o /gpu-cs ./cmd/gpu-cs/
+
+FROM debian:bullseye-slim
+RUN apt-get update && apt-get install -y ca-certificates && rm -rf /var/lib/apt/lists/*
+COPY --from=builder /gpu-cs /gpu-cs
+
+EXPOSE 443
+ENV RATLS_AUDIENCE=ratls-buffer-tee
+ENV LISTEN_ADDR=:443
+# Allow operator to override these env vars via tee-env-* metadata.
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR"
+ENTRYPOINT ["/gpu-cs"]
