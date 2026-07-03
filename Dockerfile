@@ -54,14 +54,20 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt /tmp/requirements.txt
-# torch from the CUDA 12.1 index (compatible with the 12.3 runtime); the rest,
-# including onnxruntime-gpu, from PyPI. --ignore-installed blinker: the Ubuntu
-# base ships a distutils-installed blinker 1.4 that pip cannot cleanly remove;
-# this lets the pinned version install over it without a partial-uninstall error.
+# onnxruntime flavor is chosen at build time from a single codebase → two images:
+#   default (GPU/H100):  onnxruntime-gpu==1.19.2  (links libcudart.so.12 / libcudnn.so.9)
+#   CPU fallback image:  build with --build-arg ONNXRUNTIME_PKG=onnxruntime==1.19.2
+#                        (no CUDA provider .so → cannot segfault on a GPU-less VM)
+ARG ONNXRUNTIME_PKG=onnxruntime-gpu==1.19.2
+# torch from the CUDA 12.1 index (compatible with the 12.3 runtime); the rest from
+# PyPI. --ignore-installed blinker: the Ubuntu base ships a distutils-installed
+# blinker 1.4 that pip cannot cleanly remove; this lets the pinned version install
+# over it without a partial-uninstall error.
 RUN python -m pip install --upgrade pip \
     && python -m pip install --extra-index-url https://download.pytorch.org/whl/cu121 \
         --ignore-installed blinker \
-        -r /tmp/requirements.txt
+        -r /tmp/requirements.txt \
+        "$ONNXRUNTIME_PKG"
 
 COPY . /app
 COPY --from=ratls-builder /out/gpu-cs /usr/local/bin/gpu-cs
