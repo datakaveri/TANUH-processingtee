@@ -1,132 +1,109 @@
 # TANUH Processing TEE
 
-GCP Confidential Space VM that receives encrypted jobs from the Buffer TEE, runs ONNX inference inside the TEE, and submits results to GCS and the leaderboard. Two variants exist — GPU and CPU — built from separate directories but sharing the same `enclave_manager_new.py` pipeline.
+GCP Confidential Space VM that receives secure jobs from the Buffer TEE over RA-TLS, runs ONNX inference inside the TEE, submits results to the external leaderboard, notifies the buffer, and deallocates itself. One codebase builds both the GPU and CPU images.
 
-## Variants
-
-| Variant | Directory | ONNX Runtime | Base Image | GCP VM |
-|---|---|---|---|---|
-| **GPU** | `Processing_TEE/` | `onnxruntime-gpu==1.19.2` (CUDAExecutionProvider) | `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` | `gpu-cs-tdx-h100` |
-| **CPU** | `Processing_TEE_CPU/` | `onnxruntime==1.19.2` (CPUExecutionProvider only) | `nvidia/cuda:12.3.2-cudnn9-runtime-ubuntu22.04` | `cpu-cs-tdx` |
-
-The CPU variant sets `NVIDIA_VISIBLE_DEVICES=none` and `CUDA_VISIBLE_DEVICES=-1` so the CUDA runtime is never initialised, avoiding the segfault that `onnxruntime-gpu` triggers on machines without a physical GPU.
-
-The GPU variant uses `NVIDIA_VISIBLE_DEVICES=all` and links against `libcudart.so.12` / `libcudnn.so.9` from the CUDA 12.3 + cuDNN 9 base image.
+The runtime is a **single Go binary** (`processing-tee`). Python exists in the image only for the evaluation scripts fetched from `gs://tanuh-eval-scripts` at job time, executed as a subprocess.
 
 ## Architecture
 
 ```
 Buffer TEE
-  │  Encrypted job payload over RA-TLS  (:443)
+  │  secure job payload over RA-TLS  (POST /api/load-model, :443)
   ▼
-Go RA-TLS server  (b2p-ratls/cmd/gpu-cs/)
-  │  Verifies Buffer TEE attestation + decrypts payload
-  ▼
-Flask enclave manager  :4000  (enclave_manager_new.py)
-  │  Materializes model/weights/preprocessing artifacts
-  │  Fetches + decrypts dataset from GCS
-  │  Fetches eval script from GCS
-  │  Runs ONNX inference
-  │
-  ├──▶  GCS  gs://p3dx-tanuh-results/results/:job_id/results.json
-  └──▶  Leaderboard  POST https://benchmark.tanuh.ai/leaderboard/submit-solution
-            (Bearer = caller's Keycloak JWT)
-  │
-  └──▶  stop-processing-vm.sh  (self-deallocates after job completes)
+processing-tee (Go, single process)
+  ├─ startup: network-policy attestation (policy hash bound into eat_nonce)
+  ├─ RA-TLS server  (/ratls/connect: OIDC token, EKM channel binding)
+  ├─ payload materialisation  (base64 + SHA-256 fail-closed verification)
+  ├─ dataset fetch (GCS) + AES-256-GCM decrypt (key from Secret Manager)
+  ├─ eval script fetch (GCS) → python3 subprocess   ← the only Python
+  ├─ leaderboard POST  (Bearer = caller's Keycloak JWT; attestation claims in body)
+  ├─ completion callback → buffer  POST {buffer_job_url}/complete
+  └─ self-deallocation  (Compute API stop; after job + idle timeout)
 ```
 
-## Job Pipeline
+There is no Flask layer, no localhost hop, and no app-layer payload
+encryption: confidentiality in transit is the RA-TLS channel; integrity is
+the browser's SHA-256 commitment re-verified before eval.
 
-1. Buffer TEE dispatches encrypted payload over RA-TLS → enclave manager accepts it on a background thread
-2. Job artifacts (model, weights, optional preprocessing script) materialized under `/app/cvm_workflow/secure_jobs/:job_id/artifacts/`
-3. Dataset fetched and decrypted from GCS → written to `runtime/dataset_<id>_decrypted.json`
-4. Eval script fetched from GCS (`evaluation_script_<dataset_id>.py`) — **never modified by this repo**
-5. ONNX model loaded; inference runs against all dataset samples
-6. Results JSON written to `runtime/results.json`
-7. Results uploaded to GCS and POSTed to the leaderboard with the user's Keycloak JWT as the Bearer token
-8. `stop-processing-vm.sh` called → VM deallocates itself
+## Eval contract (frozen)
 
-## Components
+```
+python3 evaluation_script_<dataset_id>.py --model M --dataset D --results R [--preprocessing P]
+```
+
+Exit codes: `10` = user preprocessing failure, `11` = CUDA/GPU environment
+failure, other non-zero = script error. This is the versioned API between the
+Go pipeline and the Python eval world.
+
+## Layout
 
 | Path | Role |
 |---|---|
-| `enclave_manager_new.py` | Main pipeline — job materialisation, dataset fetch, inference, GCS upload, leaderboard submit |
-| `Fetch_data/fetch_data.py` | GCS dataset and eval script download helpers |
-| `Fetch_data/secrets.py` | GCP Secret Manager access + OAuth token helpers (with retry/backoff) |
-| `b2p-ratls/` | RA-TLS server submodule (Go) |
-| `stop-processing-vm.sh` | Self-deallocation script called after job completion or idle timeout |
-| `entrypoint.sh` | Container entrypoint — starts Flask + RA-TLS server |
+| `cmd/processing-tee/` | main: policy attestation → RA-TLS server → serve |
+| `internal/ratls/` | RA-TLS server, EKM nonce (dependency-free audit surface) |
+| `internal/pipeline/` | job lifecycle: materialise → dataset → eval → report → dealloc |
+| `internal/gcp/` | stdlib REST: metadata tokens, GCS, Secret Manager, Compute stop |
+| `internal/crypto/` | dataset AES-256-GCM formats (small blob + chunked stream) |
+| `internal/leaderboard/` | metrics mapping, uuid5 job ids, error classification, submit |
+| `internal/attest/` | CS launcher token fetch + claims decode |
+| `internal/policy/` | startup network-policy attestation (Python-compatible hash) |
+| `internal/eval/` | evaluation subprocess runner |
+| `policy/network_policy.json` | the attested network policy (data, ships in image) |
+| `tools/` | dataset preparation/upload (dev-only, not shipped) |
+
+go.mod has **zero external dependencies**.
 
 ## Environment Variables
 
-All runtime vars must be passed via GCP Confidential Space metadata with the `tee-env-` prefix.
+All runtime vars are passed via Confidential Space metadata with the `tee-env-` prefix.
 
 | Variable | Default | Description |
 |---|---|---|
-| `RATLS_AUDIENCE` | `ratls-buffer-tee` | Expected audience in the Buffer TEE's OIDC token |
-| `LISTEN_ADDR` | `:443` | Address the RA-TLS server listens on |
-| `INTERNAL_ADDR` | `127.0.0.1:8081` | Internal address used by the RA-TLS server |
-| `PROCESSING_MANAGER_JOB_URL` | `http://127.0.0.1:4000/enclave/cvm/secure-job` | Flask endpoint the RA-TLS server forwards jobs to |
-| `PROCESSING_IDLE_TIMEOUT_SECONDS` | `300` | Seconds of inactivity before self-deallocation |
-| `PROCESSING_DEALLOCATE_AFTER_JOB` | `1` | Set to `1` to deallocate immediately after each job |
-| `PROJECT` | — | GCP project ID (used by stop script) |
-| `ZONE` | — | GCP zone of this VM (used by stop script) |
-| `INSTANCE` | — | GCP instance name of this VM (used by stop script) |
+| `RATLS_AUDIENCE` | `ratls-buffer-tee` | Audience for this TEE's attestation tokens |
+| `LISTEN_ADDR` | `:443` | RA-TLS listen address |
+| `PROCESSING_IDLE_TIMEOUT_SECONDS` | `300` | Idle seconds before self-deallocation |
+| `PROCESSING_DEALLOCATE_AFTER_JOB` | `1` | Deallocate after each job (success or failure) |
+| `PROCESSING_EVAL_TIMEOUT_SECONDS` | `3600` | Hard cap on the eval subprocess (0 disables) |
+| `PROJECT` / `ZONE` / `INSTANCE` | sandbox/us-central1-a/gpu-cs-tdx-h100 | Self-stop target — **set INSTANCE per VM** (`cpu-cs-tdx` on the CPU VM) |
+| `LEADERBOARD_SUBMIT_URL` | benchmark.tanuh.ai/leaderboard/submit-solution | Leaderboard endpoint |
 
 ## Build & Deploy
 
-### GPU variant
+One codebase → two images via the `ONNXRUNTIME_PKG` build arg:
 
 ```bash
+# GPU image (default: onnxruntime-gpu)
 IMAGE=us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls/gpu-cs
+docker build -t $IMAGE:<tag> .
+docker push $IMAGE:<tag>
 
-cd Processing_TEE/
-docker build -t $IMAGE:processing-tee-v<N> .
-docker push $IMAGE:processing-tee-v<N>
-```
-
-### CPU variant
-
-```bash
+# CPU image (CPU-only onnxruntime — cannot segfault on a GPU-less VM)
 IMAGE=us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls/cpu-cs
-
-cd Processing_TEE_CPU/
-docker build -t $IMAGE:latest .
-docker push $IMAGE:latest
+docker build --build-arg ONNXRUNTIME_PKG=onnxruntime==1.19.2 -t $IMAGE:<tag> .
+docker push $IMAGE:<tag>
 ```
 
-Update the Buffer TEE's VM metadata so it dispatches to the new digest:
+Point the VMs at the new digests and update the Buffer TEE's expected digests
+(RA-TLS pins them):
+
 ```bash
-# CPU TEE
 gcloud compute instances add-metadata cpu-cs-tdx --zone=us-central1-a \
-  --metadata tee-image-reference=$IMAGE@sha256:<digest>
-
-# GPU TEE
+  --metadata tee-image-reference=<cpu image@sha256:digest>
 gcloud compute instances add-metadata gpu-cs-tdx-h100 --zone=us-central1-a \
-  --metadata tee-image-reference=us-central1-docker.pkg.dev/p3dx-depa-sandbox/ratls/gpu-cs:processing-tee-v<N>
+  --metadata tee-image-reference=<gpu image@sha256:digest>
+gcloud compute instances add-metadata buffer-tee-vm-tdx --zone=us-east1-c \
+  --metadata tee-env-CPU_CS_IMAGE_DIGEST=sha256:<cpu>,tee-env-GPU_CS_IMAGE_DIGEST=sha256:<gpu>
 ```
-
-Also update `GPU_CS_IMAGE_DIGEST` / `CPU_CS_IMAGE_DIGEST` in the Buffer TEE VM metadata so the RA-TLS verification passes.
-
-## Key Differences: GPU vs CPU
-
-| | GPU (`Processing_TEE/`) | CPU (`Processing_TEE_CPU/`) |
-|---|---|---|
-| `requirements.txt` | `onnxruntime-gpu==1.19.2` + `torch==2.2.2` | `onnxruntime==1.19.2` (CPU-only) |
-| `NVIDIA_VISIBLE_DEVICES` | `all` | `none` |
-| `CUDA_VISIBLE_DEVICES` | *(unset)* | `-1` |
-| ONNX provider | `CUDAExecutionProvider` → `CPUExecutionProvider` | `CPUExecutionProvider` only |
-| `allow_env_override` | 6 vars | 9 vars (adds `PROJECT`, `ZONE`, `INSTANCE`) |
-| GitHub branch | `main` | `cpu_tee` |
 
 ## Debug
 
 Serial/container logs include:
-- `[Google-CVM workflow]` — enclave manager lifecycle and job events
-- `[evaluation_script]` — output from the GCS eval script during inference
-- `gpu-cs:` — RA-TLS server events
+- `pipeline:` — job lifecycle and state transitions
+- `[evaluation_script]` — eval subprocess output
+- `ratls/server:` — RA-TLS connect events
+- `policy:` / `POLICY STARTUP ATTESTATION` — boot-time policy evidence
 
-Runtime state is persisted at `/app/cvm_workflow/` inside the container:
+Runtime state persists under `/app/cvm_workflow/`:
 - `secure_jobs/:job_id/artifacts/` — model, weights, preprocessing script
 - `secure_jobs/:job_id/runtime/results.json` — inference results
-- `runtime_state.json` — current VM status (idle / running / complete / deallocation_requested)
+- `runtime/secure_runtime_state.json` — current status (waiting_for_job / running / complete / error / deallocation_requested)
