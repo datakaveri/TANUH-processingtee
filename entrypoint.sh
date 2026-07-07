@@ -28,4 +28,7 @@ cleanup() {
 trap cleanup INT TERM EXIT
 
 cd /app
+
+python policy/startup_policy_attestation.py
+
 exec python enclave_manager_new.py

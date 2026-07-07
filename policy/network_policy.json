@@ -1,0 +1,69 @@
+{
+  "version": "1.0",
+  "policy_name": "processing-tee-network-policy",
+
+  "rules": [
+    {
+      "destination": "metadata.google.internal",
+      "protocol": "tcp",
+      "ports": [80],
+      "download": "ALLOW",
+      "upload": "ALLOW",
+      "description": "Allow GCP metadata server for OAuth2 and OIDC tokens"
+    },
+
+    {
+      "destination": "secretmanager.googleapis.com",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "ALLOW",
+      "upload": "DENY",
+      "description": "Allow Secret Manager key retrieval only"
+    },
+
+    {
+      "destination": "storage.googleapis.com",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "ALLOW",
+      "upload": "ALLOW",
+      "description": "Allow GCS dataset download and result upload"
+    },
+
+    {
+      "destination": "benchmark.tanuh.ai",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "DENY",
+      "upload": "ALLOW",
+      "description": "Allow benchmark result upload only"
+    },
+
+    {
+      "destination": "pypi.org",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "ALLOW",
+      "upload": "DENY",
+      "description": "Allow PyPI package downloads"
+    },
+
+    {
+      "destination": "files.pythonhosted.org",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "ALLOW",
+      "upload": "DENY",
+      "description": "Allow Python wheel downloads"
+    },
+
+    {
+      "destination": "upload.pypi.org",
+      "protocol": "tcp",
+      "ports": [443],
+      "download": "DENY",
+      "upload": "DENY",
+      "description": "Block PyPI publishing"
+    }
+  ]
+}
