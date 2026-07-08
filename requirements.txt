@@ -1,26 +1,15 @@
-blinker==1.6.2
-click==8.1.6
-Flask==2.3.2
-gunicorn==21.2.0
-importlib-metadata==6.8.0
-psutil==5.9.2
-itsdangerous==2.1.2
-Jinja2==3.1.2
-MarkupSafe==2.1.3
-packaging==23.1
-werkzeug==2.3.7
-zipp==3.16.2
-cryptography>=41.0.0
-python-dotenv>=1.0.0
-PyYAML>=6.0
-requests>=2.31.0
-Flask-CORS>=4.0.0
+# Python in this image exists ONLY for the evaluation scripts fetched from
+# gs://tanuh-eval-scripts at job time (see Dockerfile). The manager itself is
+# the Go binary — no Flask/web deps belong here.
+#
 # numpy pinned <2 — onnxruntime-gpu 1.19.x and torch 2.2.x cu121 wheels are
 # built against the NumPy 1.x ABI.
 numpy>=1.23.2,<2
 scikit-learn>=1.3.0
 # CUDA 12.1 wheels (installed via the cu121 extra-index in the Dockerfile);
 # compatible with the CUDA 12.3 runtime base image and driver 535.
+# The eval scripts themselves import onnx/onnxruntime/cv2/pydicom/PIL/sklearn;
+# torch/torchvision/transformers stay available for user preprocessing.py code.
 torch==2.2.2
 torchvision==0.17.2
 onnx>=1.14.0
@@ -36,3 +25,10 @@ pylibjpeg[all]>=2.0.0
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 transformers>=4.35.0
+# Baked-in extras commonly used by user preprocessing scripts. Anything else
+# a preprocessing.py imports is installed at job time by dep_scanner.py + uv
+# (network policy allows pypi.org/files.pythonhosted.org download-only).
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-image>=0.21.0
+einops>=0.7.0
