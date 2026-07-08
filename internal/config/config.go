@@ -40,6 +40,7 @@ type Config struct {
 	IdleTimeout       time.Duration
 	DeallocAfterJob   bool
 	EvalTimeout       time.Duration // 0 disables the timeout
+	DepsTimeout       time.Duration // pre-eval uv install cap; 0 disables
 	LeaderboardURL    string
 	PolicyPath        string
 	AttestAudience    string // audience for leaderboard attestation claims
@@ -82,6 +83,7 @@ func FromEnv() Config {
 		IdleTimeout:     secondsEnv("PROCESSING_IDLE_TIMEOUT_SECONDS", 300),
 		DeallocAfterJob: getEnv("PROCESSING_DEALLOCATE_AFTER_JOB", "1") == "1",
 		EvalTimeout:     secondsEnv("PROCESSING_EVAL_TIMEOUT_SECONDS", 3600),
+		DepsTimeout:     secondsEnv("PROCESSING_DEPS_TIMEOUT_SECONDS", 600),
 		LeaderboardURL: getEnv("LEADERBOARD_SUBMIT_URL",
 			"https://benchmark.tanuh.ai/leaderboard/submit-solution"),
 		PolicyPath:       getEnv("NETWORK_POLICY_PATH", base+"/policy/network_policy.json"),

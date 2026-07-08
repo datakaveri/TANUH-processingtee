@@ -64,6 +64,15 @@ func Classify(err error) ErrorInfo {
 		}
 	}
 
+	// Pre-eval dependency install failure (dep_scanner/uv). Checked after the
+	// env keywords so a network/timeout failure classifies as environment;
+	// anything else (nonexistent package, resolution conflict) is the user's
+	// imports.
+	var depsErr *eval.DepsError
+	if errors.As(err, &depsErr) {
+		return ErrorInfo{1, "PreprocessingDepsError", SanitizeMsg(msg)}
+	}
+
 	if errors.Is(err, fs.ErrNotExist) {
 		return ErrorInfo{3, "FileNotFoundError", SanitizeMsg(msg)}
 	}

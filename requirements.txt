@@ -25,3 +25,10 @@ pylibjpeg[all]>=2.0.0
 opencv-python-headless>=4.8.0
 Pillow>=10.0.0
 transformers>=4.35.0
+# Baked-in extras commonly used by user preprocessing scripts. Anything else
+# a preprocessing.py imports is installed at job time by dep_scanner.py + uv
+# (network policy allows pypi.org/files.pythonhosted.org download-only).
+scipy>=1.10.0
+pandas>=2.0.0
+scikit-image>=0.21.0
+einops>=0.7.0

@@ -78,6 +78,8 @@ func TestClassify(t *testing.T) {
 		{"cuda exit 11", &eval.ExitCodeError{Code: 11}, 3, "EvalEnvironmentError"},
 		{"other exit", &eval.ExitCodeError{Code: 7}, 2, "EvalScriptError"},
 		{"env keyword", fmt.Errorf("connection to Secret Manager timed out"), 3, "EnvironmentError"},
+		{"deps user error", &eval.DepsError{Output: "no such package: nonexistent-lib"}, 1, "PreprocessingDepsError"},
+		{"deps network error", &eval.DepsError{Output: "connection reset while downloading"}, 3, "EnvironmentError"},
 		{"generic", fmt.Errorf("something odd happened"), 2, "PipelineError"},
 	}
 	for _, tc := range cases {

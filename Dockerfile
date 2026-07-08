@@ -30,7 +30,7 @@ ENV PYTHONUNBUFFERED=1 \
     CUDA_VISIBLE_DEVICES=-1 \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
 
-LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL"
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL"
 LABEL "tee.launch_policy.allow_cmd_override"="false"
 
 WORKDIR /app
@@ -73,9 +73,16 @@ RUN python -m pip install --upgrade pip \
         -r /tmp/requirements.txt \
         "$ONNXRUNTIME_PKG"
 
-# Runtime payload: the Go binary and the network policy it attests at boot.
-# No Python application code ships — eval scripts arrive from GCS at job time.
+# UV — used at job time by dep_scanner.py to install any third-party
+# packages a user preprocessing script imports that this image doesn't ship
+# (pypi.org / files.pythonhosted.org are download-only in the network policy).
+COPY --from=ghcr.io/astral-sh/uv:0.7.0 /uv /bin/uv
+
+# Runtime payload: the Go binary, the network policy it attests at boot, and
+# the dependency scanner the pipeline runs before an eval with user
+# preprocessing. Eval scripts themselves arrive from GCS at job time.
 COPY policy/network_policy.json /app/policy/network_policy.json
+COPY dep_scanner.py /app/dep_scanner.py
 COPY --from=go-builder /out/processing-tee /usr/local/bin/processing-tee
 
 EXPOSE 443

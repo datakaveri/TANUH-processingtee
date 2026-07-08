@@ -122,7 +122,18 @@ func (m *Manager) runSteps(ctx context.Context, job *materialized) error {
 		return err
 	}
 
-	// Step 4: run the evaluation subprocess.
+	// Step 4: when the user sent a preprocessing script, install any
+	// third-party imports the image doesn't ship (dep_scanner.py + uv)
+	// before the eval subprocess launches.
+	if job.preprocessingPath != "" {
+		if err := eval.InstallDeps(ctx, m.cfg.BaseDir,
+			filepath.Join(m.cfg.BaseDir, "dep_scanner.py"),
+			job.preprocessingPath, m.cfg.DepsTimeout); err != nil {
+			return err
+		}
+	}
+
+	// Step 5: run the evaluation subprocess.
 	resultsPath := filepath.Join(job.runtimeDir, "results.json")
 	if err := eval.Run(ctx, m.cfg.BaseDir, scriptPath, job.modelPath, datasetPath,
 		resultsPath, job.preprocessingPath, m.cfg.EvalTimeout); err != nil {
