@@ -40,6 +40,15 @@
     },
 
     {
+      "destination": "tee.dev.tanuh.iudx.io",
+      "protocol": "tcp",
+      "ports": [8443],
+      "download": "DENY",
+      "upload": "ALLOW",
+      "description": "Allow job completion callback to the Buffer TEE"
+    },
+
+    {
       "destination": "pypi.org",
       "protocol": "tcp",
       "ports": [443],

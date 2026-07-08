@@ -43,6 +43,7 @@ type Config struct {
 	LeaderboardURL    string
 	PolicyPath        string
 	AttestAudience    string // audience for leaderboard attestation claims
+	CallbackAudience  string // audience for the buffer completion-callback token
 	CallbackTimeout   time.Duration
 }
 
@@ -83,9 +84,10 @@ func FromEnv() Config {
 		EvalTimeout:     secondsEnv("PROCESSING_EVAL_TIMEOUT_SECONDS", 3600),
 		LeaderboardURL: getEnv("LEADERBOARD_SUBMIT_URL",
 			"https://benchmark.tanuh.ai/leaderboard/submit-solution"),
-		PolicyPath:      getEnv("NETWORK_POLICY_PATH", base+"/policy/network_policy.json"),
-		AttestAudience:  "https://tanuh-processing-tee",
-		CallbackTimeout: 10 * time.Second,
+		PolicyPath:       getEnv("NETWORK_POLICY_PATH", base+"/policy/network_policy.json"),
+		AttestAudience:   "https://tanuh-processing-tee",
+		CallbackAudience: getEnv("CALLBACK_AUDIENCE", "tanuh-buffer-callback"),
+		CallbackTimeout:  10 * time.Second,
 	}
 }
 

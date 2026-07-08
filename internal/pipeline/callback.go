@@ -3,19 +3,27 @@ package pipeline
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"io"
 	"log"
 	"net/http"
 
+	"github.com/datakaveri/tanuh-processing-tee/internal/attest"
 	"github.com/datakaveri/tanuh-processing-tee/internal/leaderboard"
 )
 
 // notifyBuffer POSTs the job's terminal status to the Buffer TEE's
 // completion endpoint (buffer_job_url + "/complete", forwarded in the
-// dispatch payload). This is the completion callback that lets the buffer
-// distinguish a clean finish from a crash instead of inferring completion
-// from self-deallocation. Best-effort: the buffer's dealloc-based finalize
+// dispatch payload — served on the buffer's :8443 Go server).
+//
+// Authentication is this workload's own CS attestation token, requested
+// with eat_nonce = hex(sha256(request body)): the buffer verifies the token
+// against Google's CS JWKS, checks our image_digest against the digests it
+// dispatches to, and recomputes the body hash — so only the attested
+// Processing TEE can complete jobs, and the token cannot be replayed with a
+// different payload. Best-effort: the buffer's bounded requeue-on-timeout
 // remains the fallback when the callback cannot be delivered.
 func (m *Manager) notifyBuffer(ctx context.Context, bufferJobURL, jobID, status string, errInfo *leaderboard.ErrorInfo) {
 	if bufferJobURL == "" {
@@ -35,6 +43,14 @@ func (m *Manager) notifyBuffer(ctx context.Context, bufferJobURL, jobID, status 
 		return
 	}
 
+	// Bind the attestation token to this exact payload.
+	bodySum := sha256.Sum256(payload)
+	token, err := attest.TokenViaSocket(ctx, m.cfg.CallbackAudience, []string{hex.EncodeToString(bodySum[:])})
+	if err != nil {
+		log.Printf("pipeline: completion callback for job %s skipped — no attestation token: %v", jobID, err)
+		return
+	}
+
 	url := bufferJobURL + "/complete"
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(payload))
 	if err != nil {
@@ -42,6 +58,7 @@ func (m *Manager) notifyBuffer(ctx context.Context, bufferJobURL, jobID, status 
 		return
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
 
 	client := &http.Client{Timeout: m.cfg.CallbackTimeout}
 	resp, err := client.Do(req)
