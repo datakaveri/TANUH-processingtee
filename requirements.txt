@@ -21,7 +21,7 @@ numpy>=1.23.2,<2
 scikit-learn>=1.3.0
 # CUDA 12.1 wheels (installed via the cu121 extra-index in the Dockerfile);
 # compatible with the CUDA 12.3 runtime base image and driver 535.
-torch==2.2.2
+torch==2.13.0
 torchvision==0.17.2
 onnx>=1.14.0
 # onnxruntime is installed in the Dockerfile via the ONNXRUNTIME_PKG build ARG
