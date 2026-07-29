@@ -30,9 +30,6 @@ ENV PYTHONUNBUFFERED=1 \
     CUDA_VISIBLE_DEVICES=-1 \
     LD_LIBRARY_PATH=/usr/local/nvidia/lib64:/usr/local/cuda/lib64:/usr/local/cuda/targets/x86_64-linux/lib
 
-LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,EVAL_SCRIPTS_BUCKET,CALLBACK_AUDIENCE"
-LABEL "tee.launch_policy.allow_cmd_override"="false"
-
 WORKDIR /app
 
 # python3.11 from deadsnakes to match the prior runtime (3.11) on Ubuntu 22.04,
@@ -84,6 +81,11 @@ COPY --from=ghcr.io/astral-sh/uv:0.7.0 /uv /bin/uv
 COPY policy/network_policy.json /app/policy/network_policy.json
 COPY dep_scanner.py /app/dep_scanner.py
 COPY --from=go-builder /out/processing-tee /usr/local/bin/processing-tee
+
+# Launch-policy labels last: label edits then never invalidate the heavy
+# apt/pip layer cache above.
+LABEL "tee.launch_policy.allow_env_override"="RATLS_AUDIENCE,LISTEN_ADDR,PROCESSING_IDLE_TIMEOUT_SECONDS,PROCESSING_DEALLOCATE_AFTER_JOB,PROCESSING_EVAL_TIMEOUT_SECONDS,PROCESSING_DEPS_TIMEOUT_SECONDS,PROJECT,ZONE,INSTANCE,LEADERBOARD_SUBMIT_URL,GCP_PROJECT_ID,DATASETS_BUCKET,EVAL_SCRIPTS_BUCKET,CALLBACK_AUDIENCE"
+LABEL "tee.launch_policy.allow_cmd_override"="false"
 
 EXPOSE 443
 

@@ -26,8 +26,8 @@
       "protocol": "tcp",
       "ports": [443],
       "download": "ALLOW",
-      "upload": "ALLOW",
-      "description": "Allow GCS dataset download and result upload"
+      "upload": "DENY",
+      "description": "Allow GCS dataset download"
     },
 
     {
