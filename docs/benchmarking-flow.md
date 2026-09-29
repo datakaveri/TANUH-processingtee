@@ -171,8 +171,8 @@ The Processing TEE reads these fields at job time; they are not passed with the 
 ```bash
 gcloud storage buckets create gs://tanuh-evaluators --project=proj-tanuh-benchmark-ptfm --location=asia-south1 --uniform-bucket-level-access
 gcloud storage buckets update gs://tanuh-evaluators --versioning
-gcloud storage cp evaluators/binary_classification/evaluate.py     gs://tanuh-evaluators/binary_classification/evaluate.py
-gcloud storage cp evaluators/multiclass_classification/evaluate.py gs://tanuh-evaluators/multiclass_classification/evaluate.py
+gcloud storage cp evaluation_LEGACY/binary_classification/evaluate.py     gs://tanuh-evaluators/binary_classification/evaluate.py
+gcloud storage cp evaluation_LEGACY/multiclass_classification/evaluate.py gs://tanuh-evaluators/multiclass_classification/evaluate.py
 gcloud storage buckets add-iam-policy-binding gs://tanuh-evaluators \
   --member=serviceAccount:<service account that reads gs://file-server-data> --role=roles/storage.objectViewer
 ```

@@ -1,0 +1,7 @@
+sample_id,true_rating,predicted_rating
+img_001,4,4
+img_002,2,2
+img_003,1,3
+img_004,3,4
+img_005,1,1
+img_006,2,3

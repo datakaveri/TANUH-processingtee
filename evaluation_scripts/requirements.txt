@@ -1,0 +1,8 @@
+# Kept in sync with TANUH-processingtee/requirements.txt's numpy/scikit-learn
+# pins so the metrics engine behaves identically when imported inside the
+# processing TEE's eval scripts.
+numpy>=1.23.2,<2
+scikit-learn>=1.3.0
+
+# Dev/test only
+pytest>=7.4.0

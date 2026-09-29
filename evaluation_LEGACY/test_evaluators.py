@@ -1,7 +1,7 @@
 """
 Contract tests for the bucket evaluators (stdlib unittest; needs numpy + scikit-learn).
 
-    python3 -m unittest evaluators/test_evaluators.py
+    python3 -m unittest evaluation_LEGACY/test_evaluators.py
 
 Each evaluator is run as a subprocess exactly as the Processing TEE runs it,
 so the tests pin the CLI, the exit codes and the results.json shape.

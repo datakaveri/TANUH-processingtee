@@ -77,7 +77,7 @@ satisfy the dataset's catalogue definitions is submitted as failed
 | `internal/policy/` | startup network-policy attestation (Python-compatible hash) |
 | `policy/network_policy.json` | the attested network policy (data, ships in image) |
 | `tools/infer/infer.py` | platform inference (stage 1) — ships as `/app/infer.py` |
-| `evaluators/<bucket>/evaluate.py` | bucket evaluators — uploaded to `gs://tanuh-evaluators/<bucket>/` |
+| `evaluation_LEGACY/<bucket>/evaluate.py` | bucket evaluators — uploaded to `gs://tanuh-evaluators/<bucket>/` |
 | `tools/check_model.py`, `tools/reference/` | model-provider check, reference adaptors, model wrappers (not shipped) |
 
 go.mod has **zero external dependencies**.
